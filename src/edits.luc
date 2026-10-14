@@ -1,0 +1,354 @@
+## The edits the views and menus make, each one undoable step. Structural
+## ones republish the song to the engine; a knob or a track's mix goes to
+## the playing program directly (`live`), so turning it is instant.
+from workspace import Workspace
+from song import Track, Lane, Clip, Graph, GraphNode, Wire, Note, Point, ScaleKey, key_at, sort_keys
+import workspace as ws
+import catalog
+import presets
+import rack
+import groups
+
+# ------------------------------------------------ tracks and lanes
+
+## A track with a notes lane playing a new instrument (`instrument`, a
+## preset), selected.
+pub func add_track(w: Workspace, instrument: str = "Init Synth") -> unit!:
+    w.perform("Add track", func () -> unit!:
+        let song = w.song
+        let track = song.add_track(f"Track {song.tracks.length + 1}")
+        let lane = song.add_lane(track, "Notes", false)
+        _ = presets.add_device(song, track, instrument, lane, 0)
+        w.track = track.id
+        w.lane = lane.id
+        w.device = -1
+        w.node = -1)
+
+pub func delete_track(w: Workspace) -> unit!:
+    let track = w.selected_track() else return
+    let id = track.id
+    w.perform("Delete track", func () -> unit!:
+        let at = w.song.tracks.map((t) => t.id).index_of(id) else return
+        _ = w.song.tracks.remove_at(at)
+        w.track = w.song.tracks[min_int(at, w.song.tracks.length - 1)].id if w.song.tracks.length > 0 else -1
+        w.device = -1
+        w.lane = -1
+        w.clips = [])
+
+func min_int(a: int, b: int) -> int:
+    return a if a < b else b
+
+## A lane on the selected track: notes, or with `curve` a curve.
+pub func add_lane(w: Workspace, curve: bool) -> unit!:
+    let track = w.selected_track() else return
+    w.perform("Add lane", func () -> unit!:
+        let lane = w.song.add_lane(track, f"Curve {track.lanes.length + 1}" if curve else f"Notes {track.lanes.length + 1}", curve)
+        w.lane = lane.id)
+
+pub func delete_lane(w: Workspace) -> unit!:
+    let track = w.selected_track() else return
+    let lane = w.selected_lane() else return
+    let id = lane.id
+    w.perform("Delete lane", func () -> unit!:
+        track.lanes = track.lanes.filter((l) => l.id != id)
+        if let node = w.song.lane_node(track, id):
+            track.rack.remove(node.id)
+        w.lane = track.lanes[0].id if track.lanes.length > 0 else -1)
+
+pub func rename_track(w: Workspace, name: str) -> unit!:
+    let track = w.selected_track() else return
+    w.perform("Rename track", func () -> unit!:
+        track.name = name)
+
+## The selected track's volume (dB), pan, mute and solo, live.
+pub func set_mix(w: Workspace, track: Track, volume: float, pan: float, mute: bool, solo: bool):
+    track.volume = volume
+    track.pan = pan
+    track.mute = mute
+    track.solo = solo
+    w.bridge.set_track(track)
+    w.changed(live = true)
+
+pub func toggle_mute(w: Workspace, track: Track) -> unit!:
+    w.perform("Mute", func () -> unit!:
+        set_mix(w, track, track.volume, track.pan, not track.mute, track.solo))
+
+pub func toggle_solo(w: Workspace, track: Track) -> unit!:
+    w.perform("Solo", func () -> unit!:
+        set_mix(w, track, track.volume, track.pan, track.mute, not track.solo))
+
+## Arm `track` to hear and record live MIDI (or disarm it): armed tracks
+## listen even when not selected.
+pub func toggle_arm(w: Workspace, track: Track) -> unit!:
+    w.perform("Arm" if not track.armed else "Disarm", func () -> unit!:
+        track.armed = not track.armed)
+
+# ------------------------------------------------ clips
+
+## A new clip on `lane` from `start` for `length` beats, selected and open.
+pub func add_clip(w: Workspace, lane: Lane, start: float, length: float) -> unit!:
+    var made = -1
+    w.perform("Add clip", func () -> unit!:
+        let clip = Clip(w.song.next_id(), lane.name, start, length)
+        if lane.curve:
+            clip.points = [Point(beat = 0.0, value = 0.5, shape = 0), Point(beat = length, value = 0.5, shape = 0)]
+        lane.clips.append(clip)
+        made = clip.id)
+    w.select_clip(made)
+
+pub func delete_clips(w: Workspace) -> unit!:
+    if w.clips.length == 0:
+        return
+    let gone = w.clips.copy()
+    w.perform("Delete clips", func () -> unit!:
+        for track in w.song.tracks:
+            for lane in track.lanes:
+                lane.clips = lane.clips.filter((c) => not (c.id in gone))
+        w.clips = []
+        if w.clip in gone:
+            w.clip = -1)
+
+## Copies of the selected clips just after the last of them, selected.
+pub func duplicate_clips(w: Workspace) -> unit!:
+    if w.clips.length == 0:
+        return
+    let chosen = w.clips.copy()
+    w.perform("Duplicate clips", func () -> unit!:
+        var first = 1.0e18
+        var last = -1.0e18
+        for id in chosen:
+            if let found12 = w.song.clip(id):
+                let (_, _, clip) = found12
+                first = first if first < clip.start else clip.start
+                last = last if last > clip.end() else clip.end()
+        let shift = last - first
+        let made: list[int] = []
+        for id in chosen:
+            if let found13 = w.song.clip(id):
+                let (_, lane, clip) = found13
+                let copy = clip.copy(with_id = w.song.next_id())
+                copy.start = clip.start + shift
+                lane.clips.append(copy)
+                made.append(copy.id)
+        w.clips = made
+        if made.length > 0:
+            w.clip = made[0])
+
+## Snap `beat` to the workspace's grid.
+pub func snap(w: Workspace, beat: float, enabled: bool = true) -> float:
+    if not enabled or w.grid <= 0.0:
+        return beat
+    return float(int(beat / w.grid + (0.5 if beat >= 0.0 else -0.5))) * w.grid
+
+# ------------------------------------------------ notes and points
+
+## A note in the edited clip, its index picked.
+pub func add_note(w: Workspace, clip: Clip, start: float, length: float, pitch: int, velocity: float = 0.8):
+    clip.notes.append(Note(start = start, length = length, pitch = pitch, velocity = velocity))
+    w.picked = [clip.notes.length - 1]
+    w.changed()
+
+pub func delete_picked(w: Workspace) -> unit!:
+    let found14 = w.edited_clip() else return
+    let (_, lane, clip) = found14
+    if w.picked.length == 0:
+        return
+    let gone = w.picked.copy()
+    w.perform("Delete notes" if not lane.curve else "Delete points", func () -> unit!:
+        if lane.curve:
+            let kept: list[Point] = []
+            for at in 0..<clip.points.length:
+                if not (at in gone):
+                    kept.append(clip.points[at])
+            clip.points = kept
+        else:
+            let kept: list[Note] = []
+            for at in 0..<clip.notes.length:
+                if not (at in gone):
+                    kept.append(clip.notes[at])
+            clip.notes = kept
+        w.picked = [])
+
+## Keep a curve's points in order of beat, the picked ones followed.
+pub func sort_points(w: Workspace, clip: Clip):
+    let order: list[int] = []
+    for at in 0..<clip.points.length:
+        order.append(at)
+    order.sort(key = (at) => clip.points[at].beat)
+    let points = order.map((at) => clip.points[at])
+    w.picked = w.picked.map((at) => order.index_of(at) else 0)
+    clip.points = points
+
+# ------------------------------------------------ graphs
+
+## A node of `kind` (a patch kind) in the graph shown, at (x, y), picked.
+pub func add_node(w: Workspace, kind: int, x: float, y: float) -> unit!:
+    let graph = w.shown_graph() else return
+    w.perform("Add " + catalog.kind_name(kind), func () -> unit!:
+        let node = GraphNode(w.song.next_id(), kind, catalog.kind_name(kind), x, y)
+        if kind == catalog.inlet_kind or kind == catalog.outlet_kind:
+            node.port = groups.next_port(graph, kind)
+            let side = "in" if kind == catalog.inlet_kind else "out"
+            node.name = f"{side} {node.port + 1}"
+        elif kind == catalog.group_kind:
+            node.patch = Graph()
+        graph.nodes.append(node)
+        w.select_node(node.id))
+
+## Place `node` (a preset's device or module, ids fresh) in the graph shown
+## at (x, y), picked.
+pub func place(w: Workspace, node: GraphNode, x: float, y: float) -> unit!:
+    let graph = w.shown_graph() else return
+    w.perform("Add " + node.name, func () -> unit!:
+        let made = node.fresh(w.song)
+        made.x = x
+        made.y = y
+        graph.nodes.append(made)
+        w.select_node(made.id))
+
+## Collapse the picked nodes of the patch shown into a group, picked.
+pub func collapse(w: Workspace) -> unit!:
+    if not w.showing_patch() or w.nodes.length == 0:
+        return
+    let graph = w.shown_graph() else return
+    let chosen = w.nodes.copy()
+    w.perform("Group nodes", func () -> unit!:
+        if let group = groups.collapse(w.song, graph, chosen):
+            w.select_node(group.id))
+
+## Put the picked group's nodes back where it stands.
+pub func expand(w: Workspace) -> unit!:
+    let graph = w.shown_graph() else return
+    let group = graph.find(w.node) else return
+    if group.kind != catalog.group_kind:
+        return
+    w.perform("Ungroup", func () -> unit!:
+        let inside = group.patch
+        groups.expand(graph, group)
+        w.nodes = []
+        if let inner = inside:
+            for node in inner.nodes:
+                if graph.find(node.id) != none:
+                    w.nodes.append(node.id)
+        w.node = w.nodes[0] if w.nodes.length > 0 else -1)
+
+## A device of preset `name` in the selected track's rack, at (x, y), picked.
+pub func add_device(w: Workspace, name: str, x: float, y: float) -> unit!:
+    let track = w.selected_track() else return
+    w.perform("Add " + name, func () -> unit!:
+        let device = presets.make(w.song, name, x, y)
+        track.rack.nodes.append(device)
+        w.device = -1
+        w.node = device.id
+        w.focus = 3)
+
+## Wire output `output` of `source` to input `input` of `target` in the
+## graph shown, when the ports fit and no loop closes.
+pub func connect(w: Workspace, source: int, output: int, target: int, input: int) -> unit!:
+    let graph = w.shown_graph() else return
+    let from_node = graph.find(source) else return
+    let to_node = graph.find(target) else return
+    let track = w.selected_track()
+    if w.showing_patch():
+        if rack.port_at(groups.outputs(from_node), output) == none or rack.port_at(groups.inputs(to_node), input) == none:
+            return
+    elif not rack.fits(track, from_node, output, to_node, input):
+        return
+    let sums = not w.showing_patch() and rack.sums(to_node, input)
+    w.perform("Connect", func () -> unit!:
+        if not graph.connect(Wire(source = source, output = output, target = target, input = input), sums = sums):
+            error(catalog_loop, "that wire would close a loop"))
+
+let catalog_loop: ErrorCode = ErrorCode.package(1)
+
+pub func disconnect(w: Workspace, target: int, input: int) -> unit!:
+    let graph = w.shown_graph() else return
+    w.perform("Disconnect", func () -> unit!:
+        graph.disconnect(target, input))
+
+## Remove one wire exactly.
+pub func cut_wire(w: Workspace, wire: Wire) -> unit!:
+    let graph = w.shown_graph() else return
+    w.perform("Cut wire", func () -> unit!:
+        graph.wires = graph.wires.filter((x) => x != wire))
+
+## Delete the picked nodes of the graph shown (a lane's node and the
+## track's output stay: they belong to the track).
+pub func delete_nodes(w: Workspace) -> unit!:
+    let graph = w.shown_graph() else return
+    let doomed: list[int] = []
+    for id in w.nodes:
+        if let node = graph.find(id):
+            if node.kind != catalog.lane_kind and node.kind != catalog.output_kind:
+                doomed.append(id)
+    if doomed.length == 0:
+        return
+    w.perform("Delete nodes" if doomed.length > 1 else "Delete node", func () -> unit!:
+        for id in doomed:
+            graph.remove(id)
+        w.select_node(-1))
+
+## Set parameter `slot` of the picked patch node to `value`: the engine
+## hears it at once, the song keeps it.
+pub func set_param(w: Workspace, node: GraphNode, slot: int, value: float):
+    if slot < 0 or slot >= node.params.length:
+        return
+    node.params[slot] = value
+    if let device = w.selected_device():
+        w.bridge.set_param(device.id, node.id, slot, value)
+        # A Control In's index changes the device's ports: republish.
+        w.changed(live = node.kind != catalog.named("Control In"))
+    else:
+        w.changed()
+
+# ------------------------------------------------ scale keys
+
+## A key change on row `row` (the song's or a track's) at `beat`, keeping the
+## scale already in force there (C major on an empty row); it is picked.
+pub func add_key(w: Workspace, row: int, beat: float) -> unit!:
+    let keys = w.keys_of(row) else return
+    for at in 0..<keys.length:
+        if keys[at].beat == beat:
+            pick_key(w, row, at)
+            return
+    var root = 0
+    var mode = 1
+    if let current = key_at(keys, beat):
+        root = current.root
+        mode = current.mode
+    w.perform("Add key", func () -> unit!:
+        let row_keys = w.keys_of(row) else return
+        row_keys.append(ScaleKey(beat = beat, root = root, mode = mode))
+        settle_keys(w, row, beat))
+
+## Pick key `index` of row `row`.
+pub func pick_key(w: Workspace, row: int, index: int):
+    w.key_row = row
+    w.key = index
+    w.focus = ws.focus_key
+    w.changed(live = true)
+
+## Put row `row`'s keys back in beat order, the picked one followed to `beat`.
+pub func settle_keys(w: Workspace, row: int, beat: float):
+    let keys = w.keys_of(row) else return
+    let sorted = sort_keys(keys)
+    keys.clear()
+    keys.extend(sorted)
+    for at in 0..<keys.length:
+        if keys[at].beat == beat:
+            w.key_row = row
+            w.key = at
+    w.focus = ws.focus_key
+    w.changed()
+
+## Remove the picked key.
+pub func delete_key(w: Workspace) -> unit!:
+    if w.selected_key() == none:
+        return
+    w.perform("Delete key", func () -> unit!:
+        let keys = w.keys_of(w.key_row) else return
+        _ = keys.remove_at(w.key)
+        w.key = -1
+        w.focus = ws.focus_track
+        w.changed())
+

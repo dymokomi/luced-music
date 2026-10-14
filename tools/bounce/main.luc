@@ -1,0 +1,74 @@
+## Render songs to WAV files without an audio device:
+##     bounce [song.prisma ...] [--seconds N] [--out DIR]
+## With no song, the demo songs (presets.demo_songs) each go to DIR
+## (default ~/Music/Luced Music Bounces) as NAME.wav.
+import presets
+import songs
+import project
+from bridge import Bridge
+from song import Song
+from luce_std import files, paths
+
+func bounce(song: Song, path: str, seconds: float) -> unit!:
+    let bridge = Bridge(48000.0)
+    bridge.publish(song)
+    bridge.engine.seek(0.0)
+    bridge.engine.play()
+    bridge.engine.render(int(seconds * 48000.0))
+    bridge.engine.export_wav(path)
+    print(f"{path}: {seconds:.1f} s, RMS {bridge.engine.level(0):.3f} / {bridge.engine.level(1):.3f}")
+    bridge.close()
+
+pub func main(arguments: list[str]) -> int!:
+    var out = paths.join(files.home_directory(), "Music/Luced Music Bounces")
+    var seconds = 0.0
+    var stems = false
+    var auditions = false
+    var only = ""
+    let given: list[str] = []
+    var at = 0
+    while at < arguments.length:
+        if arguments[at] == "--out" and at + 1 < arguments.length:
+            out = arguments[at + 1]
+            at += 1
+        elif arguments[at] == "--stems":
+            stems = true
+        elif arguments[at] == "--presets":
+            auditions = true
+        elif arguments[at] == "--only" and at + 1 < arguments.length:
+            only = arguments[at + 1]
+            at += 1
+        elif arguments[at] == "--seconds" and at + 1 < arguments.length:
+            seconds = float(arguments[at + 1])
+            at += 1
+        else:
+            given.append(arguments[at])
+        at += 1
+    files.ensure_directory(out)
+    if auditions:
+        # Every preset alone: an instrument plays a phrase, an effect hears a pluck.
+        for name in presets.instrument_names() + presets.effect_names():
+            if only != "" and name != only: continue
+            let song = presets.audition(name)
+            bounce(song, paths.join(out, name + ".wav"), song.length() * 60.0 / song.tempo + 2.0)
+        return 0
+    if given.length == 0:
+        for (name, song) in songs.all_songs():
+            if only != "" and name != only: continue
+            let passes = 2.0 if song.loop_on else 1.0
+            let length = seconds if seconds > 0.0 else song.length() * passes * 60.0 / song.tempo + 3.0
+            bounce(song, paths.join(out, name + ".wav"), length)
+            # The song itself, to open in the app.
+            project.save(song, paths.join(out, name + ".prisma"))
+            if stems:
+                for solo in song.tracks:
+                    for track in song.tracks:
+                        track.mute = track.id != solo.id
+                    bounce(song, paths.join(out, f"{name} - {solo.name}.wav"), length)
+                for track in song.tracks:
+                    track.mute = false
+    for path in given:
+        let song = project.load(path)
+        let length = seconds if seconds > 0.0 else song.length() * 60.0 / song.tempo + 3.0
+        bounce(song, paths.join(out, paths.stem(path) + ".wav"), length)
+    return 0

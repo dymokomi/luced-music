@@ -1,0 +1,449 @@
+## The clip open for editing: a piano roll for a note clip, a curve for an
+## automation clip, both over the clip's beats with its loop marked.
+## Piano roll: a click on the grid adds a note of the grid's length (drag to
+## lengthen it), a note drags to move (pitch and time), its right edge to
+## resize, Shift adds to the picked notes, Delete removes them; the keys at
+## the left play the lane's instrument. Curve: a click adds a point, a point
+## drags, Alt-click removes it, a right-click makes it hold or ramp. A mouse
+## wheel zooms (Shift-wheel scrolls the keys); the middle button pans.
+from luce_ui.ui import Widget, Layout, Constraints, Size, Event, Painter, Point, Font
+from luce_gpu.gpu import RenderTarget, Rect, Color
+from luce_window.input import EventKind, Key, ScrollUnit
+from luce_std import math
+from workspace import Workspace
+from song import Track, Lane, Clip, Point as CurvePoint
+import catalog
+import edits
+import theme
+
+let keys_width: float = 52.0
+let ruler: float = 22.0
+let edge: float = 6.0
+
+pub class ClipEditor: Widget:
+    let box: Layout
+    let workspace: Workspace
+    let font: Font
+    let small: Font
+    pub var scale: float = 60.0
+    pub var left_beat: float = 0.0
+    ## The pitch at the top row, and pixels a semitone.
+    pub var top_pitch: float = 84.0
+    pub var key_height: float = 12.0
+    var mode: str = ""
+    var start_x: float = 0.0
+    var start_y: float = 0.0
+    ## Where a middle-button pan last was.
+    var pan_x: float = 0.0
+    var pan_y: float = 0.0
+    var origins: list[(int, float, int, float)]
+    var grabbed: int = -1
+    var sounding: int = -1
+    var sounding_unit: int = -1
+    var shown_clip: int = -2
+
+    pub func init(self, workspace: Workspace, font: Font) -> unit!:
+        self.workspace = workspace
+        self.font = font
+        self.small = Font(font.size() - 3.0)
+        self.origins = []
+        self.box = Layout()
+        self.box.set_flex()
+        self.box.set_interactive(true)
+        self.box.set_focusable(true)
+
+    pub func layout(self) -> Layout:
+        return self.box
+
+    pub func measure(self, available: Constraints) -> Size!:
+        return Size(500.0, 220.0)
+
+    func x_of(self, beat: float) -> float:
+        return keys_width + (beat - self.left_beat) * self.scale
+
+    func beat_of(self, x: float) -> float:
+        return self.left_beat + (x - keys_width) / self.scale
+
+    func y_of(self, pitch: float) -> float:
+        return ruler + (self.top_pitch - pitch) * self.key_height
+
+    func pitch_of(self, y: float) -> int:
+        return int(math.floor(self.top_pitch - (y - ruler) / self.key_height)) + 1
+
+    ## The curve's value at height `y` of an area `height` tall.
+    func value_of(self, lane: Lane, y: float, height: float) -> float:
+        let t = 1.0 - (y - ruler - 8.0) / math.max(1.0, height - ruler - 16.0)
+        return math.clamp(lane.low + t * (lane.high - lane.low), lane.low, lane.high)
+
+    func y_of_value(self, lane: Lane, value: float, height: float) -> float:
+        let span = lane.high - lane.low if lane.high > lane.low else 1.0
+        return ruler + 8.0 + (1.0 - (value - lane.low) / span) * (height - ruler - 16.0)
+
+    ## Frame a newly shown clip: its whole length, its notes centered.
+    func frame(self, clip: Clip, width: float, height: float):
+        self.left_beat = 0.0
+        self.scale = math.max(8.0, math.min(200.0, (width - keys_width - 20.0) / math.max(1.0, clip.length)))
+        if clip.notes.length > 0:
+            var low = clip.notes[0].pitch
+            var high = low
+            for note in clip.notes:
+                low = note.pitch if note.pitch < low else low
+                high = note.pitch if note.pitch > high else high
+            let middle = float(low + high) * 0.5
+            self.top_pitch = middle + (height - ruler) / self.key_height * 0.5
+        else:
+            self.top_pitch = 72.0 + (height - ruler) / self.key_height * 0.5
+
+    pub func draw(self, target: RenderTarget) -> unit!:
+        let size = target.size()
+        let p = Painter(target)
+        p.rectangle(Rect(0.0, 0.0, size.width, size.height), theme.backdrop())
+        let opened_maybe = self.workspace.edited_clip()
+        if opened_maybe == none:
+            p.text("Double-click a clip to edit it, or on an empty lane to make one.", 14.0, 14.0, theme.text_muted(), self.font)
+            p.close()
+            return
+        let opened = opened_maybe else return
+        let (track, lane, clip) = opened
+        if clip.id != self.shown_clip:
+            self.shown_clip = clip.id
+            self.frame(clip, size.width, size.height)
+        let bar = float(self.workspace.song.beats_per_bar)
+        if not lane.curve:
+            # Rows: black keys darker, C rows marked; under a scale, its notes
+            # lit, the root most, the rest dark.
+            let scale_key = self.workspace.song.key_for(track, clip.start)
+            var pitch = int(self.top_pitch)
+            while self.y_of(float(pitch)) < size.height:
+                let y = self.y_of(float(pitch))
+                let black = is_black(pitch)
+                var shade = theme.grey(30.0) if black else theme.grey(35.0)
+                if let key = scale_key:
+                    if key.mode != 0:
+                        if not catalog.in_scale(pitch, key.root, key.mode):
+                            shade = theme.grey(24.0)
+                        elif (pitch - key.root) % 12 == 0:
+                            shade = theme.grey(46.0)
+                        else:
+                            shade = theme.grey(39.0)
+                p.rectangle(Rect(keys_width, y, size.width - keys_width, self.key_height), shade)
+                if pitch % 12 == 0:
+                    p.rectangle(Rect(keys_width, y + self.key_height - 1.0, size.width - keys_width, 1.0), theme.grey(48.0))
+                pitch -= 1
+        # Beats and bars, the grid's subdivisions when there is room.
+        let grid = self.workspace.grid if self.workspace.grid > 0.0 else 0.25
+        var beat = math.floor(self.left_beat / grid) * grid
+        while self.x_of(beat) < size.width:
+            let x = self.x_of(beat)
+            if x >= keys_width:
+                let on_bar = math.abs(beat / bar - math.floor(beat / bar + 0.5)) < 0.0001
+                let on_beat = math.abs(beat - math.floor(beat + 0.5)) < 0.0001
+                if on_bar or on_beat or self.scale * grid >= 10.0:
+                    p.rectangle(Rect(x, ruler, 1.0, size.height - ruler), theme.grey(58.0) if on_bar else (theme.grey(44.0) if on_beat else theme.grey(38.0)))
+            beat += grid
+        # Beyond the clip's end: shaded; the loop's end: marked.
+        let end_x = self.x_of(clip.length)
+        if end_x < size.width:
+            p.rectangle(Rect(math.max(keys_width, end_x), ruler, size.width - math.max(keys_width, end_x), size.height - ruler), Color(0.0, 0.0, 0.0, 0.35))
+        let period = clip.loop if clip.loop > 0.0 else clip.length
+        if period < clip.length:
+            let x = self.x_of(period)
+            if x > keys_width:
+                p.rectangle(Rect(x, ruler, 2.0, size.height - ruler), theme.accent())
+        if lane.curve:
+            self.draw_curve(p, track, lane, clip, size.width, size.height)
+        else:
+            self.draw_notes(p, track, clip, size.width, size.height)
+            self.draw_keys(p, size.height)
+        # The ruler: bars and beats from the clip's start, and the playhead.
+        p.rectangle(Rect(0.0, 0.0, size.width, ruler), theme.tab_strip())
+        var mark = math.floor(self.left_beat)
+        while self.x_of(mark) < size.width:
+            let x = self.x_of(mark)
+            if x >= keys_width:
+                let whole = int(mark)
+                if whole % self.workspace.song.beats_per_bar == 0:
+                    p.text(f"{whole // self.workspace.song.beats_per_bar + 1}", x + 3.0, 3.0, theme.text_muted(), self.small)
+                    p.rectangle(Rect(x, ruler - 7.0, 1.0, 7.0), theme.text_muted())
+                else:
+                    p.rectangle(Rect(x, ruler - 4.0, 1.0, 4.0), theme.grey(90.0))
+            mark += 1.0
+        let title = f"{track.name} / {lane.name} / {clip.name}"
+        p.rectangle(Rect(0.0, 0.0, keys_width, ruler), theme.tab_strip())
+        p.text(title, size.width - 12.0 - self.small.measure(title), 3.0, theme.text_muted(), self.small)
+        let local = self.workspace.playhead - clip.start
+        if local >= 0.0 and local <= clip.length:
+            let head = self.x_of(local - math.floor(local / period) * period if period > 0.0 else local)
+            if head >= keys_width:
+                p.rectangle(Rect(head, 0.0, 1.5, size.height), theme.playhead())
+        p.close()
+
+    func draw_keys(self, p: Painter, height: float) -> unit!:
+        var pitch = int(self.top_pitch)
+        p.rectangle(Rect(0.0, ruler, keys_width, height - ruler), theme.grey(200.0))
+        while self.y_of(float(pitch)) < height:
+            let y = self.y_of(float(pitch))
+            if is_black(pitch):
+                p.rectangle(Rect(0.0, y, keys_width * 0.62, self.key_height), theme.grey(28.0))
+            else:
+                p.rectangle(Rect(0.0, y + self.key_height - 0.5, keys_width, 0.5), theme.grey(150.0))
+            if pitch == self.sounding:
+                p.rectangle(Rect(0.0, y, keys_width, self.key_height), theme.accent())
+            if pitch % 12 == 0 and self.key_height >= 9.0:
+                p.text(f"C{pitch // 12 - 1}", keys_width - 26.0, y - 2.0, theme.grey(60.0), self.small)
+            pitch -= 1
+        p.rectangle(Rect(keys_width - 1.0, ruler, 1.0, height - ruler), theme.border())
+
+    func draw_notes(self, p: Painter, track: Track, clip: Clip, width: float, height: float) -> unit!:
+        let picked = self.workspace.picked
+        for at in 0..<clip.notes.length:
+            let note = clip.notes[at]
+            let x = self.x_of(note.start)
+            let right = self.x_of(note.start + note.length)
+            let y = self.y_of(float(note.pitch))
+            if right < keys_width or x > width or y + self.key_height < ruler or y > height:
+                continue
+            let left = math.max(x, keys_width)
+            let chosen = at in picked
+            let body = theme.track_color(track.color)
+            let shade = 0.45 + 0.55 * note.velocity
+            p.rounded_rectangle(Rect(left, y + 0.5, math.max(2.0, right - left - 1.0), self.key_height - 1.0), theme.accent() if chosen else theme.grey(20.0), 2.0)
+            p.rounded_rectangle(Rect(left + 1.0, y + 1.5, math.max(1.0, right - left - 3.0), self.key_height - 3.0), Color(body.red * shade, body.green * shade, body.blue * shade, 1.0), 1.5)
+            # A note the scale moves: a mark on the row it sounds.
+            if let key = self.workspace.song.key_for(track, clip.start + note.start):
+                let sounds = catalog.quantize_note(note.pitch, key.root, key.mode)
+                if sounds != note.pitch:
+                    let moved_y = self.y_of(float(sounds))
+                    p.rounded_rectangle(Rect(left, moved_y + self.key_height * 0.35, math.max(2.0, right - left - 1.0), self.key_height * 0.3), Color(body.red, body.green, body.blue, 0.55), 1.0)
+
+    func draw_curve(self, p: Painter, track: Track, lane: Lane, clip: Clip, width: float, height: float) -> unit!:
+        let low_y = self.y_of_value(lane, lane.low, height)
+        let high_y = self.y_of_value(lane, lane.high, height)
+        p.rectangle(Rect(keys_width, high_y, width - keys_width, 1.0), theme.grey(48.0))
+        p.rectangle(Rect(keys_width, low_y, width - keys_width, 1.0), theme.grey(48.0))
+        p.text(f"{lane.high:.2f}", 4.0, high_y - 6.0, theme.text_muted(), self.small)
+        p.text(f"{lane.low:.2f}", 4.0, low_y - 6.0, theme.text_muted(), self.small)
+        let ink = theme.track_color(track.color)
+        for at in 0..<clip.points.length:
+            let point = clip.points[at]
+            let here = Point(self.x_of(point.beat), self.y_of_value(lane, point.value, height))
+            if at + 1 < clip.points.length:
+                let next = clip.points[at + 1]
+                let there = Point(self.x_of(next.beat), self.y_of_value(lane, next.value, height))
+                if point.shape == 1:
+                    p.line(here, Point(there.x, here.y), 2.0, ink)
+                    p.line(Point(there.x, here.y), there, 1.0, ink)
+                else:
+                    p.line(here, there, 2.0, ink)
+            let r = 5.0
+            p.rounded_rectangle(Rect(here.x - r, here.y - r, 2.0 * r, 2.0 * r), theme.accent() if at in self.workspace.picked else ink, r)
+
+    ## The note under (x, y), with whether it is on the note's right edge.
+    func note_at(self, clip: Clip, x: float, y: float) -> (int, bool)?:
+        let pitch = self.pitch_of(y)
+        for at in (0..<clip.notes.length).reversed():
+            let note = clip.notes[at]
+            if note.pitch != pitch:
+                continue
+            let left = self.x_of(note.start)
+            let right = self.x_of(note.start + note.length)
+            if x >= left and x <= right:
+                return (at, x >= right - edge)
+        return none
+
+    func point_at(self, lane: Lane, clip: Clip, x: float, y: float, height: float) -> int:
+        for at in 0..<clip.points.length:
+            let point = clip.points[at]
+            if math.abs(self.x_of(point.beat) - x) <= 7.0 and math.abs(self.y_of_value(lane, point.value, height) - y) <= 7.0:
+                return at
+        return -1
+
+    pub func event(self, event: Event) -> unit!:
+        let w = self.workspace
+        if event.cancelled or event.kind == EventKind.focus_lost or event.kind == EventKind.overflow:
+            if self.mode == "move" or self.mode == "resize" or self.mode == "point":
+                w.cancel()
+            self.mode = ""
+            self.release_key()
+        elif event.kind == EventKind.key_down:
+            if event.key == Key.delete or event.key == Key.backspace:
+                edits.delete_picked(w)
+            elif event.key == Key.a and (event.meta or event.control):
+                if let found1 = w.edited_clip():
+                    let (_, lane, clip) = found1
+                    let count = clip.points.length if lane.curve else clip.notes.length
+                    w.picked = []
+                    for at in 0..<count:
+                        w.picked.append(at)
+                    w.revision += 1
+        elif event.kind == EventKind.magnify:
+            self.zoom_about(math.max(0.1, 1.0 + event.scroll_y), event.x)
+        elif event.kind == EventKind.scroll:
+            let wheel = event.scroll_unit != ScrollUnit.points
+            if event.meta or event.control or (wheel and not event.shift and event.scroll_y != 0.0):
+                self.zoom_about(math.exp(event.scroll_y * (0.12 if wheel else 0.01)), event.x)
+            else:
+                let factor = 30.0 if wheel else 1.0
+                var dx = event.scroll_x * factor
+                var dy = event.scroll_y * factor
+                if event.shift and dx == 0.0 and not wheel:
+                    dx = dy
+                    dy = 0.0
+                self.pan(dx, dy)
+        elif event.kind == EventKind.pointer_down and event.inside and event.button == 2:
+            self.mode = "pan"
+            self.pan_x = event.x
+            self.pan_y = event.y
+        elif event.kind == EventKind.pointer_down and event.inside:
+            self.press(event)
+        elif event.kind == EventKind.pointer_moved:
+            if self.mode == "pan":
+                self.pan(event.x - self.pan_x, event.y - self.pan_y)
+                self.pan_x = event.x
+                self.pan_y = event.y
+            else:
+                self.drag(event)
+        elif event.kind == EventKind.pointer_up:
+            if self.mode == "move" or self.mode == "resize" or self.mode == "point":
+                if event.x == self.start_x and event.y == self.start_y and self.mode != "point":
+                    w.cancel()
+                else:
+                    w.commit()
+            elif self.mode == "create":
+                w.commit()
+            self.mode = ""
+            self.release_key()
+        self.box.invalidate()
+
+    ## Move the view `dx` pixels along the beats and `dy` down the keys.
+    func pan(self, dx: float, dy: float):
+        self.left_beat = math.max(0.0, self.left_beat - dx / self.scale)
+        self.top_pitch = math.max(10.0, math.min(127.0, self.top_pitch + dy / self.key_height))
+
+    func zoom_about(self, factor: float, x: float):
+        let beat = self.beat_of(x)
+        self.scale = math.max(4.0, math.min(800.0, self.scale * factor))
+        self.left_beat = math.max(0.0, beat - (x - keys_width) / self.scale)
+
+    func play_key(self, track: Track, lane: Lane, pitch: int):
+        self.release_key()
+        let device = self.workspace.instrument_of_lane(track, lane.id)
+        if device >= 0:
+            self.workspace.bridge.engine.note_on(device, pitch, 0.8)
+            self.sounding = pitch
+            self.sounding_unit = device
+
+    func release_key(self):
+        if self.sounding >= 0 and self.sounding_unit >= 0:
+            self.workspace.bridge.engine.note_off(self.sounding_unit, self.sounding)
+        self.sounding = -1
+
+    func press(self, event: Event) -> unit!:
+        let w = self.workspace
+        let found2 = w.edited_clip() else return
+        let (track, lane, clip) = found2
+        w.focus = 4
+        self.start_x = event.x
+        self.start_y = event.y
+        if event.y < ruler:
+            return
+        let height = self.box.bounds().height
+        if lane.curve:
+            let hit = self.point_at(lane, clip, event.x, event.y, height)
+            if event.button == 1:
+                if hit >= 0:
+                    w.perform("Point shape", func () -> unit!:
+                        clip.points[hit].shape = 1 - clip.points[hit].shape)
+                return
+            if hit >= 0 and event.alt:
+                w.picked = [hit]
+                edits.delete_picked(w)
+                return
+            w.begin("Move point" if hit >= 0 else "Add point")
+            if hit < 0:
+                let beat = math.clamp(edits.snap(w, self.beat_of(event.x), not event.meta), 0.0, clip.length)
+                clip.points.append(CurvePoint(beat = beat, value = self.value_of(lane, event.y, height), shape = 0))
+                w.picked = [clip.points.length - 1]
+                edits.sort_points(w, clip)
+            else:
+                w.picked = [hit]
+            self.grabbed = w.picked[0] if w.picked.length > 0 else -1
+            self.mode = "point"
+            w.changed()
+            return
+        if event.button != 0:
+            return
+        if event.x < keys_width:
+            self.play_key(track, lane, self.pitch_of(event.y))
+            self.mode = "keys"
+            return
+        if let found3 = self.note_at(clip, event.x, event.y):
+            let (at, on_edge) = found3
+            if event.shift:
+                w.picked = w.picked.filter((n) => n != at) if at in w.picked else w.picked + [at]
+                w.revision += 1
+                return
+            if not (at in w.picked):
+                w.picked = [at]
+            self.origins = []
+            for index in w.picked:
+                let note = clip.notes[index]
+                self.origins.append((index, note.start, note.pitch, note.length))
+            self.grabbed = at
+            self.mode = "resize" if on_edge else "move"
+            w.begin("Resize notes" if on_edge else "Move notes")
+            self.play_key(track, lane, clip.notes[at].pitch)
+            w.changed()
+            return
+        # Empty grid: a new note, lengthened by dragging.
+        let grid = w.grid if w.grid > 0.0 else 0.25
+        let start = math.max(0.0, math.floor(self.beat_of(event.x) / grid) * grid)
+        if start >= clip.length:
+            w.picked = []
+            w.revision += 1
+            return
+        w.begin("Add note")
+        edits.add_note(w, clip, start, grid, self.pitch_of(event.y))
+        self.grabbed = clip.notes.length - 1
+        self.origins = [(self.grabbed, start, self.pitch_of(event.y), grid)]
+        self.mode = "create"
+        self.play_key(track, lane, self.pitch_of(event.y))
+
+    func drag(self, event: Event) -> unit!:
+        let w = self.workspace
+        let found4 = w.edited_clip() else return
+        let (track, lane, clip) = found4
+        if self.mode == "keys":
+            let pitch = self.pitch_of(event.y)
+            if pitch != self.sounding:
+                self.play_key(track, lane, pitch)
+        elif self.mode == "point":
+            if self.grabbed >= 0 and self.grabbed < clip.points.length:
+                let height = self.box.bounds().height
+                clip.points[self.grabbed].beat = math.clamp(edits.snap(w, self.beat_of(event.x), not event.meta), 0.0, clip.length)
+                clip.points[self.grabbed].value = self.value_of(lane, event.y, height)
+                w.picked = [self.grabbed]
+                edits.sort_points(w, clip)
+                self.grabbed = w.picked[0]
+                w.changed()
+        elif self.mode == "move":
+            let shift = edits.snap(w, (event.x - self.start_x) / self.scale, not event.meta)
+            let rise = int(math.floor((self.start_y - event.y) / self.key_height + 0.5))
+            for (index, start, pitch, _) in self.origins:
+                if index < clip.notes.length:
+                    clip.notes[index].start = math.max(0.0, start + shift)
+                    clip.notes[index].pitch = 0 if pitch + rise < 0 else (127 if pitch + rise > 127 else pitch + rise)
+            if self.grabbed < clip.notes.length and clip.notes[self.grabbed].pitch != self.sounding:
+                self.play_key(track, lane, clip.notes[self.grabbed].pitch)
+            w.changed()
+        elif self.mode == "resize" or self.mode == "create":
+            let grid = w.grid if w.grid > 0.0 else 0.25
+            let grown = edits.snap(w, (event.x - self.start_x) / self.scale, not event.meta)
+            for (index, _, _, length) in self.origins:
+                if index < clip.notes.length:
+                    clip.notes[index].length = math.max(grid if not event.meta else 0.05, length + grown)
+            w.changed()
+
+func is_black(pitch: int) -> bool:
+    let step = pitch % 12
+    return step == 1 or step == 3 or step == 6 or step == 8 or step == 10

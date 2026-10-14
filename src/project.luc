@@ -1,0 +1,258 @@
+## Song files: a Prism text document (`.prisma`), one element per track,
+## lane, clip and graph node, in order:
+##
+##     /song                          tempo, meter, loop, master, keys, next id
+##     /song/track_N                  name, channels, mix, color, keyed, keys, midi
+##     /song/track_N/lane_N           name, curve, range
+##     /song/track_N/lane_N/clip_N    placement, notes [n, 4] or points [n, 3]
+##     /song/track_N/rack             wires [n, 4]
+##     /song/track_N/rack/node_N      kind, name, position, parameters, voices
+##     .../node_N/patch               a device's patch, as a rack is kept
+from luce_prism.prism import Document, Value, Encoding, write_durable
+from luce_std import files
+from song import Song, Track, Lane, Clip, Graph, GraphNode, Wire, Note, Point, ScaleKey, sort_keys
+import catalog
+
+let invalid: ErrorCode = ErrorCode.package(2)
+
+pub func save(song: Song, path: str) -> unit!:
+    let doc = Document()
+    doc.add("/song", "luced_music")
+    doc.set("/song", "version", Value.integer(1))
+    doc.set("/song", "name", Value.text(song.name))
+    doc.set("/song", "tempo", Value.number(song.tempo))
+    doc.set("/song", "beats_per_bar", Value.integer(song.beats_per_bar))
+    doc.set("/song", "loop", Value.numbers([3], [1.0 if song.loop_on else 0.0, song.loop_start, song.loop_end]))
+    doc.set("/song", "master", Value.number(song.master))
+    doc.set("/song", "keys", keys_value(song.keys))
+    doc.set("/song", "next_id", Value.integer(song.last_id()))
+    for (t, track) in song.tracks.indexed():
+        let at = f"/song/track_{t}"
+        doc.add(at, "track")
+        doc.set(at, "id", Value.integer(track.id))
+        doc.set(at, "name", Value.text(track.name))
+        doc.set(at, "mix", Value.numbers([6], [float(track.channels), track.volume, track.pan, 1.0 if track.mute else 0.0, 1.0 if track.solo else 0.0, float(track.color)]))
+        # Bit 1 folded, bit 2 the master bus.
+        doc.set(at, "folded", Value.integer((1 if track.folded else 0) + (2 if track.master else 0)))
+        doc.set(at, "keyed", Value.integer(track.keyed))
+        doc.set(at, "midi", Value.numbers([3], [float(track.midi_in), float(track.midi_channel), 1.0 if track.armed else 0.0]))
+        doc.set(at, "keys", keys_value(track.keys))
+        for (l, lane) in track.lanes.indexed():
+            let lane_at = f"{at}/lane_{l}"
+            doc.add(lane_at, "lane")
+            doc.set(lane_at, "id", Value.integer(lane.id))
+            doc.set(lane_at, "name", Value.text(lane.name))
+            doc.set(lane_at, "curve", Value.integer(1 if lane.curve else 0))
+            doc.set(lane_at, "range", Value.numbers([2], [lane.low, lane.high]))
+            for (c, clip) in lane.clips.indexed():
+                let clip_at = f"{lane_at}/clip_{c}"
+                doc.add(clip_at, "clip")
+                doc.set(clip_at, "id", Value.integer(clip.id))
+                doc.set(clip_at, "name", Value.text(clip.name))
+                doc.set(clip_at, "place", Value.numbers([4], [clip.start, clip.length, clip.loop, clip.pan]))
+                let notes: list[float] = []
+                for note in clip.notes:
+                    notes.extend([note.start, note.length, float(note.pitch), note.velocity])
+                doc.set(clip_at, "notes", Value.numbers([clip.notes.length, 4], notes))
+                let points: list[float] = []
+                for point in clip.points:
+                    points.extend([point.beat, point.value, float(point.shape)])
+                doc.set(clip_at, "points", Value.numbers([clip.points.length, 3], points))
+        write_graph(doc, f"{at}/rack", track.rack)
+    let encoded = doc.encode(Encoding.text)
+    write_durable(path, encoded.bytes())
+
+## Scale keys as [n, 3] numbers: beat, root, mode.
+func keys_value(keys: list[ScaleKey]) -> Value!:
+    let flat: list[float] = []
+    for key in keys:
+        flat.extend([key.beat, float(key.root), float(key.mode)])
+    return Value.numbers([keys.length, 3], flat)
+
+## The scale keys at `at` (a song or track), none in a file from before them.
+func read_keys(doc: Document, at: str) -> list[ScaleKey]!:
+    let keys: list[ScaleKey] = []
+    if not doc.has_property(at, "keys"):
+        return keys
+    let value = doc.get(at, "keys")
+    for k in 0..<value.count() // 3:
+        keys.append(ScaleKey(beat = value.number_at(k * 3), root = int(value.number_at(k * 3 + 1)), mode = int(value.number_at(k * 3 + 2))))
+    return sort_keys(keys)
+
+pub func write_graph(doc: Document, at: str, graph: Graph) -> unit!:
+    doc.add(at, "graph")
+    let wires: list[float] = []
+    for wire in graph.wires:
+        wires.extend([float(wire.source), float(wire.output), float(wire.target), float(wire.input)])
+    doc.set(at, "wires", Value.numbers([graph.wires.length, 4], wires))
+    for (n, node) in graph.nodes.indexed():
+        let node_at = f"{at}/node_{n}"
+        doc.add(node_at, "node")
+        doc.set(node_at, "id", Value.integer(node.id))
+        doc.set(node_at, "kind", Value.text(kind_key(node.kind)))
+        doc.set(node_at, "name", Value.text(node.name))
+        doc.set(node_at, "position", Value.numbers([2], [node.x, node.y]))
+        doc.set(node_at, "params", Value.numbers([node.params.length], node.params))
+        doc.set(node_at, "voices", Value.integer(node.voices))
+        doc.set(node_at, "lane", Value.integer(node.lane))
+        doc.set(node_at, "port", Value.integer(node.port))
+        if let patch = node.patch:
+            write_graph(doc, f"{node_at}/patch", patch)
+
+## A kind as the file keeps it: by name, so the engine may renumber its kinds.
+func kind_key(kind: int) -> str:
+    if kind == catalog.lane_kind:
+        return "@lane"
+    if kind == catalog.device_kind:
+        return "@device"
+    if kind == catalog.output_kind:
+        return "@output"
+    if kind == catalog.group_kind:
+        return "@group"
+    if kind == catalog.inlet_kind:
+        return "@inlet"
+    if kind == catalog.outlet_kind:
+        return "@outlet"
+    return catalog.kind_name(kind)
+
+func kind_of(key: str) -> int!:
+    if key == "@lane":
+        return catalog.lane_kind
+    if key == "@device":
+        return catalog.device_kind
+    if key == "@output":
+        return catalog.output_kind
+    if key == "@group":
+        return catalog.group_kind
+    if key == "@inlet":
+        return catalog.inlet_kind
+    if key == "@outlet":
+        return catalog.outlet_kind
+    let kind = catalog.named(key)
+    if kind < 0:
+        error(invalid, f"This song uses a node this version does not have: {key}")
+    return kind
+
+pub func load(path: str) -> Song!:
+    let doc = Document.parse(files.read_text(path, limit = 268435456))
+    if not doc.contains("/song") or doc.type_at("/song") != "luced_music":
+        error(invalid, "Not a Luced Music song")
+    if integer(doc, "/song", "version") != 1:
+        error(invalid, "A newer song file than this version reads")
+    let song = Song()
+    song.name = doc.get("/song", "name").text_at()
+    song.tempo = number(doc, "/song", "tempo")
+    song.beats_per_bar = integer(doc, "/song", "beats_per_bar")
+    let loop = numbers(doc, "/song", "loop", 3)
+    song.loop_on = loop[0] > 0.5
+    song.loop_start = loop[1]
+    song.loop_end = loop[2]
+    song.master = number(doc, "/song", "master")
+    song.keys = read_keys(doc, "/song")
+    song.saw_id(integer(doc, "/song", "next_id"))
+    for t in 0..<doc.child_count("/song"):
+        let at = doc.child_at("/song", t) else continue
+        if doc.type_at(at) != "track":
+            continue
+        let track = Track(identity(doc, at, song), doc.get(at, "name").text_at(), 0)
+        let mix = numbers(doc, at, "mix", 6)
+        track.channels = 1 if mix[0] < 1.5 else 2
+        track.volume = mix[1]
+        track.pan = mix[2]
+        track.mute = mix[3] > 0.5
+        track.solo = mix[4] > 0.5
+        track.color = int(mix[5])
+        let flags = integer(doc, at, "folded")
+        track.folded = flags % 2 == 1
+        track.master = flags // 2 % 2 == 1
+        if doc.has_property(at, "keyed"):
+            track.keyed = integer(doc, at, "keyed")
+        track.keys = read_keys(doc, at)
+        if doc.has_property(at, "midi"):
+            let midi = numbers(doc, at, "midi", 3)
+            track.midi_in = int(midi[0])
+            track.midi_channel = int(midi[1])
+            track.armed = midi[2] > 0.5
+        for l in 0..<doc.child_count(at):
+            let child = doc.child_at(at, l) else continue
+            let kind = doc.type_at(child)
+            if kind == "lane":
+                track.lanes.append(read_lane(doc, child, song))
+            elif kind == "graph":
+                track.rack = read_graph(doc, child, song)
+        song.tracks.append(track)
+    return song
+
+func read_lane(doc: Document, at: str, song: Song) -> Lane!:
+    let lane = Lane(identity(doc, at, song), doc.get(at, "name").text_at(), integer(doc, at, "curve") != 0)
+    let range = numbers(doc, at, "range", 2)
+    lane.low = range[0]
+    lane.high = range[1]
+    for c in 0..<doc.child_count(at):
+        let child = doc.child_at(at, c) else continue
+        if doc.type_at(child) != "clip":
+            continue
+        let place = numbers(doc, child, "place", 4)
+        let clip = Clip(identity(doc, child, song), doc.get(child, "name").text_at(), place[0], place[1])
+        clip.loop = place[2]
+        clip.pan = place[3]
+        let notes = doc.get(child, "notes")
+        for k in 0..<notes.count() // 4:
+            clip.notes.append(Note(start = notes.number_at(k * 4), length = notes.number_at(k * 4 + 1), pitch = int(notes.number_at(k * 4 + 2)), velocity = notes.number_at(k * 4 + 3)))
+        let points = doc.get(child, "points")
+        for k in 0..<points.count() // 3:
+            clip.points.append(Point(beat = points.number_at(k * 3), value = points.number_at(k * 3 + 1), shape = int(points.number_at(k * 3 + 2))))
+        lane.clips.append(clip)
+    return lane
+
+pub func read_graph(doc: Document, at: str, song: Song) -> Graph!:
+    let graph = Graph()
+    let wires = doc.get(at, "wires")
+    for k in 0..<wires.count() // 4:
+        graph.wires.append(Wire(source = int(wires.number_at(k * 4)), output = int(wires.number_at(k * 4 + 1)), target = int(wires.number_at(k * 4 + 2)), input = int(wires.number_at(k * 4 + 3))))
+    for n in 0..<doc.child_count(at):
+        let child = doc.child_at(at, n) else continue
+        if doc.type_at(child) != "node":
+            continue
+        let position = numbers(doc, child, "position", 2)
+        let node = GraphNode(identity(doc, child, song), kind_of(doc.get(child, "kind").text_at()), doc.get(child, "name").text_at(), position[0], position[1])
+        let params = doc.get(child, "params")
+        let saved: list[float] = []
+        for k in 0..<params.count():
+            saved.append(params.number_at(k))
+        # Keep the kind's defaults for parameters a newer engine added.
+        for k in 0..<node.params.length:
+            if k < saved.length:
+                node.params[k] = saved[k]
+        node.voices = integer(doc, child, "voices")
+        node.lane = integer(doc, child, "lane")
+        if doc.get(child, "port").count() == 1:
+            node.port = integer(doc, child, "port")
+        let patch = f"{child}/patch"
+        if doc.contains(patch):
+            node.patch = read_graph(doc, patch, song)
+        graph.nodes.append(node)
+    return graph
+
+func identity(doc: Document, at: str, song: Song) -> int!:
+    let id = integer(doc, at, "id")
+    song.saw_id(id)
+    return id
+
+func number(doc: Document, at: str, key: str) -> float!:
+    let value = doc.get(at, key)
+    if value.count() != 1:
+        error(invalid, f"{at} {key} is not a number")
+    return value.number_at()
+
+func integer(doc: Document, at: str, key: str) -> int!:
+    return int(number(doc, at, key))
+
+func numbers(doc: Document, at: str, key: str, count: int) -> list[float]!:
+    let value = doc.get(at, key)
+    if value.count() != count:
+        error(invalid, f"{at} {key} should have {count} numbers")
+    let made: list[float] = []
+    for k in 0..<count:
+        made.append(value.number_at(k))
+    return made

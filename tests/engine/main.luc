@@ -1,0 +1,33 @@
+## The demo song through the engine, offline: every track sounds, a muted
+## track does not, and the transport moves with the tempo.
+from presets import demo_song
+from bridge import Bridge
+
+pub func main(arguments: list[str]) -> int!:
+    let song = demo_song()
+    let bridge = Bridge(48000.0)
+    bridge.publish(song)
+    let engine = bridge.engine
+    engine.play()
+    engine.render(96000)
+    let whole = engine.level(0)
+    assert(whole > 0.02, f"the demo song is too quiet: {whole}")
+    assert(engine.position() > 3.99 and engine.position() < 4.01, "two seconds at 120 bpm are four beats")
+    for at in 0..<song.tracks.length:
+        let track = song.tracks[at]
+        for other in song.tracks:
+            other.mute = other.id != track.id
+            bridge.set_track(other)
+        engine.seek(0.0)
+        engine.render(48000)
+        let level = engine.level(0, 2400)
+        assert(level > 0.002, f"{track.name} is silent: {level}")
+        print(f"{track.name}: {level:.4f}")
+    for other in song.tracks:
+        other.mute = true
+        bridge.set_track(other)
+    engine.render(4800)
+    assert(engine.level(0) == 0.0, "every track muted is silence")
+    bridge.close()
+    print(f"PASS engine: the demo song plays ({whole:.4f} RMS)")
+    return 0

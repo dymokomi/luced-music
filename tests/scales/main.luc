@@ -1,0 +1,83 @@
+## Scales and recording: the song's keys move the notes a following track
+## plays and leave an as-written track alone; keys, a track's own and its
+## MIDI settings round-trip through the file; a recorded take lands on the
+## track's notes lane as a clip.
+from presets import demo_song
+from bridge import Bridge
+from song import Song, ScaleKey
+from workspace import Workspace
+from recorder import Recorder
+import project
+from luce_std import files, paths
+
+func render(song: Song) -> list[float]!:
+    let bridge = Bridge(48000.0)
+    bridge.publish(song)
+    bridge.engine.play()
+    bridge.engine.render(96000)
+    let samples: list[float] = []
+    for i in 0..<96000:
+        samples.append(bridge.engine.sample(0, i))
+    bridge.close()
+    return samples
+
+func differs(a: list[float], b: list[float]) -> bool:
+    for i in 0..<a.length:
+        let d = a[i] - b[i]
+        if d > 0.0001 or d < -0.0001:
+            return true
+    return false
+
+pub func main(arguments: list[str]) -> int!:
+    let plain = render(demo_song())
+    # Whole-tone on C♯: most of the demo's notes move.
+    let keyed = demo_song()
+    keyed.keys = [ScaleKey(beat = 0.0, root = 1, mode = 13)]
+    assert(differs(plain, render(keyed)), "a song key moves the notes")
+    # Every track as written: the key changes nothing.
+    let written = demo_song()
+    written.keys = [ScaleKey(beat = 0.0, root = 1, mode = 13)]
+    for track in written.tracks:
+        track.keyed = 0
+    assert(not differs(plain, render(written)), "tracks as written ignore the key")
+
+    # The file keeps keys, a track's own and its MIDI settings.
+    let saved = demo_song()
+    saved.keys = [ScaleKey(beat = 8.0, root = 5, mode = 5), ScaleKey(beat = 0.0, root = 9, mode = 2)]
+    saved.tracks[1].keyed = 2
+    saved.tracks[1].keys = [ScaleKey(beat = 0.0, root = 9, mode = 11)]
+    saved.tracks[1].midi_in = 1616451150
+    saved.tracks[1].midi_channel = 3
+    saved.tracks[1].armed = true
+    let path = paths.join(files.home_directory(), "luced-music-scales-test.prisma")
+    project.save(saved, path)
+    let loaded = project.load(path)
+    assert(loaded.keys.length == 2 and loaded.keys[0].beat == 0.0 and loaded.keys[1].root == 5 and loaded.keys[1].mode == 5)
+    let track = loaded.tracks[1]
+    assert(track.keyed == 2 and track.keys.length == 1 and track.keys[0].mode == 11)
+    assert(track.midi_in == 1616451150 and track.midi_channel == 3 and track.armed)
+    assert(loaded.tracks[0].keyed == 1 and loaded.tracks[0].midi_in == 0 and not loaded.tracks[0].armed)
+
+    # A take on the selected track: a note held then let go becomes a clip.
+    let w = Workspace(demo_song())
+    let lead = w.song.tracks[0]
+    w.select_track(lead.id)
+    lead.midi_channel = 1
+    let lane = lead.record_lane() else trap("no notes lane")
+    let clips_before = lane.clips.length
+    let take = Recorder()
+    take.begin(w)
+    take.hear(w, 0x90, 64, 100, 7, 0)
+    take.hear(w, 0x80, 64, 0, 7, 0)
+    # Channel 2 is not the lead's.
+    take.hear(w, 0x91, 50, 100, 7, 0)
+    assert(take.notes.length == 1)
+    take.finish(w)
+    let after = lead.record_lane() else trap("no notes lane")
+    assert(after.clips.length == clips_before + 1, "the take became a clip")
+    let clip = after.clips[after.clips.length - 1]
+    assert(clip.notes.length == 1 and clip.notes[0].pitch == 64 and clip.length >= 4.0)
+    assert(w.can_undo())
+    w.close()
+    print("scales ok")
+    return 0

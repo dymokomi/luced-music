@@ -1,0 +1,357 @@
+## The editor's state: the song, the engine it plays through, what is
+## selected and which graph the network shows, and the history. Every edit
+## is a transaction (`perform`, or `begin` ... `commit` around a drag): the
+## song before it is kept whole, so undo puts that song back, and the
+## engine, matching ids, carries what was sounding across.
+from song import Song, Track, Lane, Clip, Graph, GraphNode, ScaleKey
+from bridge import Bridge
+import catalog
+
+## What the inspector shows: what was clicked last.
+pub let focus_track: int = 0
+pub let focus_lane: int = 1
+pub let focus_clip: int = 2
+pub let focus_node: int = 3
+pub let focus_notes: int = 4
+pub let focus_key: int = 5
+
+## Whose scale key is picked: the song's row, or a track's (its id).
+pub let song_keys: int = -1
+
+let most_steps: int = 100
+
+pub class Workspace:
+    pub var song: Song
+    pub let bridge: Bridge
+    ## Bumped by every change; views redraw and panels refresh from it.
+    pub var revision: int = 0
+    pub var track: int = -1
+    pub var lane: int = -1
+    pub var clips: list[int]
+    ## The clip the clip editor shows, and its selected notes or points.
+    pub var clip: int = -1
+    pub var picked: list[int]
+    ## The device whose patch the network shows (-1: the track's rack), and
+    ## the node picked in what it shows.
+    pub var device: int = -1
+    ## The groups entered inside the device's patch, outermost first.
+    pub var groups: list[int]
+    pub var node: int = -1
+    ## Every node picked in the graph shown (`node` is the last picked).
+    pub var nodes: list[int]
+    pub var focus: int = 0
+    ## The scale key picked: its row (`song_keys` or a track id) and index.
+    pub var key_row: int = -1
+    pub var key: int = -1
+    ## The snap for clips and notes, in beats.
+    pub var grid: float = 0.25
+    pub var path: str = ""
+    ## Where the transport is (beats) and each track's meter (0..1, decaying),
+    ## refreshed every frame from the engine.
+    pub var playhead: float = 0.0
+    pub var playing: bool = false
+    pub var levels: list[float]
+    pub var metronome: bool = false
+    pub var saved_revision: int = 0
+    var undos: list[(str, Song)]
+    var redos: list[(str, Song)]
+    var before: Song?
+    var label: str = ""
+
+    pub func init(self, song: Song, rate: float = 48000.0) -> unit!:
+        self.song = song
+        self.bridge = Bridge(rate)
+        self.clips = []
+        self.picked = []
+        self.levels = []
+        self.groups = []
+        self.nodes = []
+        self.undos = []
+        self.redos = []
+        self.before = none
+        if song.tracks.length > 0:
+            self.track = song.tracks[0].id
+            if song.tracks[0].lanes.length > 0:
+                self.lane = song.tracks[0].lanes[0].id
+        self.bridge.selected = self.track
+        self.bridge.publish(song)
+
+    pub func close(self):
+        self.bridge.close()
+
+    ## Replace the song (New, Open), forgetting the history.
+    pub func replace(self, song: Song) -> unit!:
+        self.song = song
+        self.undos = []
+        self.redos = []
+        self.before = none
+        self.clips = []
+        self.picked = []
+        self.clip = -1
+        self.device = -1
+        self.node = -1
+        self.track = song.tracks[0].id if song.tracks.length > 0 else -1
+        self.lane = -1
+        if let track = self.selected_track():
+            if track.lanes.length > 0:
+                self.lane = track.lanes[0].id
+        self.bridge.engine.stop()
+        self.bridge.selected = self.track
+        self.bridge.publish(song)
+        self.revision += 1
+        self.saved_revision = self.revision
+
+    pub func dirty(self) -> bool:
+        return self.revision != self.saved_revision
+
+    # ------------------------------------------------ transactions
+
+    ## Run `change` as one undoable step called `label`.
+    pub func perform(self, label: str, change: func() -> unit!) -> unit!:
+        self.begin(label)
+        change() catch failure:
+            self.cancel()
+            error(failure.code, failure.message)
+        self.commit()
+
+    ## Open a step that a drag or a scrub fills; `commit` closes it.
+    pub func begin(self, label: str):
+        if self.before == none:
+            self.before = self.song.copy()
+            self.label = label
+
+    pub func commit(self):
+        if let before = self.before:
+            self.undos.append((self.label, before))
+            if self.undos.length > most_steps:
+                _ = self.undos.remove_at(0)
+            self.redos = []
+        self.before = none
+        self.changed()
+
+    ## Abandon the open step, putting the song back as it was.
+    pub func cancel(self):
+        if let before = self.before:
+            self.song = before
+            self.before = none
+            self.changed()
+
+    pub func in_step(self) -> bool:
+        return self.before != none
+
+    ## Something changed: views redraw, and the engine takes the song again
+    ## (once a frame) unless `live` (the engine already has the change).
+    pub func changed(self, live: bool = false):
+        self.revision += 1
+        if not live:
+            self.bridge.dirty = true
+
+    pub func can_undo(self) -> bool:
+        return self.undos.length > 0
+
+    pub func can_redo(self) -> bool:
+        return self.redos.length > 0
+
+    pub func undo_label(self) -> str:
+        return self.undos[self.undos.length - 1].0 if self.undos.length > 0 else ""
+
+    pub func undo(self):
+        if self.undos.length == 0:
+            return
+        let (label, song) = self.undos.pop()
+        self.redos.append((label, self.song))
+        self.song = song
+        self.after_history()
+
+    pub func redo(self):
+        if self.redos.length == 0:
+            return
+        let (label, song) = self.redos.pop()
+        self.undos.append((label, self.song))
+        self.song = song
+        self.after_history()
+
+    func after_history(self):
+        if self.selected_track() == none:
+            self.track = self.song.tracks[0].id if self.song.tracks.length > 0 else -1
+        if self.device >= 0 and self.selected_device() == none:
+            self.device = -1
+            self.groups = []
+        self.groups = self.groups.filter((id) => self.patch_node(id) != none)
+        self.nodes = []
+        if self.song.clip(self.clip) == none:
+            self.clip = -1
+        self.clips = self.clips.filter((id) => self.song.clip(id) != none)
+        self.picked = []
+        self.changed()
+
+    # ------------------------------------------------ what is selected
+
+    pub func selected_track(self) -> Track?:
+        return self.song.track(self.track)
+
+    ## The scale keys of row `row`: the song's, or track `row`'s own.
+    pub func keys_of(self, row: int) -> list[ScaleKey]?:
+        if row == song_keys:
+            return self.song.keys
+        if let track = self.song.track(row):
+            return track.keys
+        return none
+
+    ## The picked scale key.
+    pub func selected_key(self) -> ScaleKey?:
+        let keys = self.keys_of(self.key_row) else return none
+        if self.key >= 0 and self.key < keys.length:
+            return keys[self.key]
+        return none
+
+    pub func selected_lane(self) -> Lane?:
+        if let track = self.selected_track():
+            return track.lane(self.lane)
+        return none
+
+    ## The clip the editor shows, with its track and lane.
+    pub func edited_clip(self) -> (Track, Lane, Clip)?:
+        return self.song.clip(self.clip)
+
+    ## The device whose patch is shown.
+    pub func selected_device(self) -> GraphNode?:
+        if self.device < 0:
+            return none
+        if let track = self.selected_track():
+            return track.rack.find(self.device)
+        return none
+
+    ## The graph the network shows: the group entered, else the selected
+    ## device's patch, else the selected track's rack.
+    pub func shown_graph(self) -> Graph?:
+        if let device = self.selected_device():
+            var graph = device.patch
+            for id in self.groups:
+                if let inside = graph:
+                    if let group = inside.find(id):
+                        graph = group.patch
+                    else:
+                        return inside
+            return graph
+        if let track = self.selected_track():
+            return track.rack
+        return none
+
+    ## Node `id` anywhere in the opened device's patch.
+    pub func patch_node(self, id: int) -> GraphNode?:
+        if let device = self.selected_device():
+            if let patch = device.patch:
+                return patch.find_deep(id)
+        return none
+
+    ## The names of the groups entered, for the network's path.
+    pub func group_names(self) -> list[str]:
+        let names: list[str] = []
+        for id in self.groups:
+            if let node = self.patch_node(id):
+                names.append(node.name)
+        return names
+
+    pub func showing_patch(self) -> bool:
+        return self.selected_device() != none
+
+    pub func selected_node(self) -> GraphNode?:
+        if let graph = self.shown_graph():
+            return graph.find(self.node)
+        return none
+
+    pub func select_track(self, id: int):
+        if id != self.track:
+            self.track = id
+            # Live MIDI follows the selection while no track is armed.
+            self.bridge.selected = id
+            self.bridge.dirty = true
+            self.device = -1
+            self.node = -1
+            self.lane = -1
+            if let track = self.selected_track():
+                if track.lanes.length > 0:
+                    self.lane = track.lanes[0].id
+        self.focus = focus_track
+        self.revision += 1
+
+    pub func select_lane(self, track: int, lane: int):
+        self.select_track(track)
+        self.lane = lane
+        self.focus = focus_lane
+        self.revision += 1
+
+    ## Select clip `id` (with `add`, toggle it among the selected), and open
+    ## it in the clip editor.
+    pub func select_clip(self, id: int, add: bool = false):
+        if let found5 = self.song.clip(id):
+            let (track, lane, _) = found5
+            if track.id != self.track:
+                self.select_track(track.id)
+            self.lane = lane.id
+        if add:
+            if id in self.clips:
+                self.clips = self.clips.filter((c) => c != id)
+            else:
+                self.clips.append(id)
+        elif not (id in self.clips):
+            self.clips = [id]
+        if self.clip != id:
+            self.picked = []
+        self.clip = id
+        self.focus = focus_clip
+        self.revision += 1
+
+    pub func select_node(self, id: int):
+        self.node = id
+        self.nodes = [id] if id >= 0 else []
+        self.focus = focus_node
+        self.revision += 1
+
+    ## Add node `id` to the picked nodes, or take it out.
+    pub func toggle_node(self, id: int):
+        if id in self.nodes:
+            self.nodes = self.nodes.filter((n) => n != id)
+            self.node = self.nodes[self.nodes.length - 1] if self.nodes.length > 0 else -1
+        else:
+            self.nodes.append(id)
+            self.node = id
+        self.focus = focus_node
+        self.revision += 1
+
+    ## Show `device`'s patch in the network (-1: back to the rack).
+    pub func enter(self, device: int):
+        self.device = device
+        self.groups = []
+        self.node = -1
+        self.nodes = []
+        self.revision += 1
+
+    ## Go into group `id` of the graph shown.
+    pub func enter_group(self, id: int):
+        self.groups.append(id)
+        self.node = -1
+        self.nodes = []
+        self.revision += 1
+
+    ## Up one level: out of a group, else out of the device to the rack.
+    pub func up(self):
+        if self.groups.length > 0:
+            let left = self.groups.pop()
+            self.node = left
+            self.nodes = [left]
+        elif self.device >= 0:
+            let left = self.device
+            self.device = -1
+            self.node = left
+            self.nodes = [left]
+        self.revision += 1
+
+    ## The unit (a device's id) that lane `lane` plays, for auditioning.
+    pub func instrument_of_lane(self, track: Track, lane: int) -> int:
+        if let node = self.song.lane_node(track, lane):
+            for wire in track.rack.wires:
+                if wire.source == node.id and wire.input == catalog.device_notes:
+                    return wire.target
+        return -1

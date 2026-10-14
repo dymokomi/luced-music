@@ -1,0 +1,147 @@
+## How a song reaches the engine: `publish` describes the whole song as a
+## program (tracks, a unit a device with its patch, lanes and their notes
+## and points, every wire) and the engine swaps it in at its next buffer,
+## carrying sounding notes over. A turned knob or a track's mix goes
+## straight to the playing program instead (`set_param`, `set_track`).
+from luce_audio.engine import Engine
+from luce_audio import engine as audio
+from song import Song, Track, Lane, Clip
+import catalog
+import groups
+
+## A gain for `db` decibels.
+pub func gain(db: float) -> float:
+    if db <= -90.0:
+        return 0.0
+    return 10.0 ** (db / 20.0)
+
+pub class Bridge:
+    pub let engine: Engine
+    ## A structural change waits to be published (once a frame at most).
+    pub var dirty: bool = true
+    pub var failure: str = ""
+    ## The selected track: with none armed, the one live MIDI plays.
+    pub var selected: int = -1
+
+    pub func init(self, rate: float = 48000.0) -> unit!:
+        self.engine = audio.open(rate)
+
+    pub func close(self):
+        self.engine.close()
+
+    ## Publish `song` now.
+    pub func publish(self, song: Song) -> unit!:
+        let e = self.engine
+        e.begin()
+        for key in song.keys:
+            e.add_key(-1, key.beat, key.root, key.mode)
+        for track in song.tracks:
+            let listening = song.listening(track, self.selected)
+            let index = e.add_track(track.id, track.channels, gain(track.volume), track.pan, track.mute, track.solo, track.master, keyed = track.keyed,
+                                    midi_in = track.midi_in if listening else -1, channel = track.midi_channel)
+            for key in track.keys:
+                e.add_key(index, key.beat, key.root, key.mode)
+            describe_track(e, song, track, index, listening)
+        e.commit()
+        e.set_tempo(song.tempo)
+        e.set_loop(song.loop_on, song.loop_start, song.loop_end)
+        e.set_master(gain(song.master))
+        self.dirty = false
+
+    ## Publish `song` if something changed since; a failure is kept to show.
+    pub func refresh(self, song: Song):
+        if not self.dirty:
+            return
+        self.publish(song) catch failure:
+            self.failure = failure.message
+            self.dirty = false
+            return
+        self.failure = ""
+
+    pub func set_param(self, device: int, node: int, slot: int, value: float):
+        self.engine.set_param(device, node, slot, value)
+
+    pub func set_track(self, track: Track):
+        self.engine.set_track(track.id, gain(track.volume), track.pan, track.mute, track.solo)
+
+func describe_track(e: Engine, song: Song, track: Track, index: int, listening: bool) -> unit!:
+    let record_lane = track.record_lane()
+    let units: map[int, int] = {}
+    let output = song.output_of(track)
+    for node in track.rack.nodes:
+        if node.kind != catalog.device_kind:
+            continue
+        var to_track = false
+        if let out = output:
+            for wire in track.rack.wires:
+                if wire.source == node.id and wire.target == out.id and wire.input == catalog.output_audio:
+                    to_track = true
+        let unit_index = e.add_unit(index, node.id, node.voices, to_track)
+        units[node.id] = unit_index
+        if let patch = node.patch:
+            # Groups are the editor's: the engine gets their nodes, flat.
+            let flat = groups.flatten(patch)
+            let made: map[int, int] = {}
+            for inner in flat.nodes:
+                let made_index = e.add_node(unit_index, inner.id, inner.kind)
+                for slot in 0..<inner.params.length:
+                    e.node_param(made_index, slot, inner.params[slot])
+                made[inner.id] = made_index
+            for wire in flat.wires:
+                if let source = made[wire.source]:
+                    if let target = made[wire.target]:
+                        e.wire(source, wire.output, target, wire.input)
+    # Audio from one device into another.
+    for wire in track.rack.wires:
+        if wire.input == catalog.device_audio:
+            if let target = units[wire.target]:
+                if let source = units[wire.source]:
+                    e.feed(target, source)
+    for lane in track.lanes:
+        let lane_index = e.add_lane(index, lane.id, lane.curve)
+        if let node = song.lane_node(track, lane.id):
+            for wire in track.rack.wires:
+                if wire.source != node.id:
+                    continue
+                if let target = units[wire.target]:
+                    if not lane.curve and wire.input == catalog.device_notes:
+                        e.play_notes(lane_index, target)
+                        # Live MIDI plays what the record lane plays.
+                        if listening:
+                            if let recording = record_lane:
+                                if recording.id == lane.id:
+                                    e.listen(index, target)
+                    elif lane.curve and wire.input >= catalog.device_control:
+                        e.drive(lane_index, target, wire.input - catalog.device_control)
+                elif let out = output:
+                    if wire.target == out.id and lane.curve:
+                        if wire.input == catalog.output_volume:
+                            e.drive(lane_index, -1, 0)
+                        elif wire.input == catalog.output_pan:
+                            e.drive(lane_index, -1, 1)
+        for clip in lane.clips:
+            describe_clip(e, lane_index, lane, clip)
+
+## A clip's notes or points on the timeline, its content repeated every
+## `loop` beats until it ends.
+func describe_clip(e: Engine, lane_index: int, lane: Lane, clip: Clip) -> unit!:
+    let period = clip.loop if clip.loop > 0.0 else clip.length
+    var offset = 0.0
+    while offset < clip.length:
+        if lane.curve:
+            for point in clip.points:
+                let at = offset + point.beat
+                if at <= clip.length:
+                    e.add_point(lane_index, clip.start + at, point.value, point.shape)
+        else:
+            for note in clip.notes:
+                let at = offset + note.start
+                if note.start >= period or at >= clip.length:
+                    continue
+                let length = min_float(note.length, clip.length - at)
+                if length > 0.0:
+                    e.add_note(lane_index, clip.start + at, length, note.pitch, note.velocity, clip.pan)
+        offset += period
+
+func min_float(a: float, b: float) -> float:
+    return a if a < b else b

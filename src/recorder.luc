@@ -1,0 +1,113 @@
+## Recording live MIDI: while the transport plays with Record on, the notes
+## the listening tracks hear (the armed ones, or with none armed the
+## selected one) are timed on the beat they were heard at; Stop lays each
+## track's take into its notes lane as a clip of whole bars, one undo step.
+from workspace import Workspace
+from song import Clip, Note
+from luce_std import math
+
+## A note held down: the track hearing it, its key, when and how hard.
+struct Held:
+    var track: int
+    var pitch: int
+    var start: float
+    var velocity: float
+
+## A note of a take, on the song's timeline.
+pub struct Taken:
+    pub var track: int
+    pub var note: Note
+
+pub class Recorder:
+    pub var on: bool = false
+    ## Where the take began, and what it holds so far.
+    pub var start: float = 0.0
+    pub var notes: list[Taken]
+    var held: list[Held]
+
+    pub func init(self):
+        self.notes = []
+        self.held = []
+
+    ## Begin a take at the playhead, starting the transport if it is stopped.
+    pub func begin(self, w: Workspace):
+        if self.on:
+            return
+        self.on = true
+        self.notes = []
+        self.held = []
+        self.start = w.playhead
+        if not w.playing:
+            w.bridge.engine.play()
+            w.playing = true
+        w.revision += 1
+
+    ## A MIDI message heard at host time `nanos`, from source `source`.
+    pub func hear(self, w: Workspace, status: int, data1: int, data2: int, source: int, nanos: int):
+        if not self.on:
+            return
+        let kind = status // 16
+        if kind != 8 and kind != 9:
+            return
+        let channel = status % 16 + 1
+        let beat = w.bridge.engine.beat_at(nanos)
+        for track in w.song.tracks:
+            if not w.song.listening(track, w.track):
+                continue
+            if track.midi_in != 0 and track.midi_in != source:
+                continue
+            if track.midi_channel != 0 and track.midi_channel != channel:
+                continue
+            if kind == 9 and data2 > 0:
+                self.held.append(Held(track = track.id, pitch = data1, start = beat, velocity = float(data2) / 127.0))
+            else:
+                self.release(w, track.id, data1, beat)
+        w.revision += 1
+
+    func release(self, w: Workspace, track: int, pitch: int, beat: float):
+        for at in 0..<self.held.length:
+            let held = self.held[at]
+            if held.track == track and held.pitch == pitch:
+                var end = beat
+                # Played across the loop's end: it ends there.
+                if end <= held.start:
+                    end = w.song.loop_end if w.song.loop_on and w.song.loop_end > held.start else held.start + 0.25
+                self.notes.append(Taken(track = track, note = Note(start = held.start, length = end - held.start, pitch = pitch, velocity = held.velocity)))
+                _ = self.held.remove_at(at)
+                return
+
+    ## End the take: what is still held ends at the playhead, and each
+    ## track's notes become a clip on its notes lane.
+    pub func finish(self, w: Workspace) -> unit!:
+        if not self.on:
+            return
+        self.on = false
+        let still = self.held.copy()
+        for held in still:
+            self.release(w, held.track, held.pitch, w.playhead)
+        self.held = []
+        if self.notes.length == 0:
+            w.revision += 1
+            return
+        let taken = self.notes.copy()
+        self.notes = []
+        let bar = float(w.song.beats_per_bar)
+        w.perform("Record", func () -> unit!:
+            for track in w.song.tracks:
+                let mine = taken.filter((t) => t.track == track.id)
+                if mine.length == 0:
+                    continue
+                let lane = track.record_lane() else continue
+                var first = mine[0].note.start
+                var last = mine[0].note.start + mine[0].note.length
+                for t in mine:
+                    first = math.min(first, t.note.start)
+                    last = math.max(last, t.note.start + t.note.length)
+                let opening = math.floor(math.max(0.0, first) / bar) * bar
+                let closing = math.max(opening + bar, math.ceil(last / bar) * bar)
+                let clip = Clip(w.song.next_id(), "Take", opening, closing - opening)
+                for t in mine:
+                    clip.notes.append(Note(start = t.note.start - opening, length = t.note.length, pitch = t.note.pitch, velocity = t.note.velocity))
+                lane.clips.append(clip)
+                w.clip = clip.id
+                w.clips = [clip.id])

@@ -1,0 +1,56 @@
+#prisma 4.0
+def package "luced-music" {
+    str owner = "dymokomi"
+    str version = "0.1.0"
+    str kind = "application"
+    str language = "luce"
+    str description = "A music editor: tracks of note and automation clips playing instruments and effects built from node networks, on a realtime engine."
+    str readme = "README.md"
+    str entry = "src/main.luc"
+
+    def application "bundle" {
+        str name = "Luced Music"
+        str identifier = "com.luciaos.luced-music"
+        str microphone = "Luced Music records from your audio input."
+    }
+
+    def dependency "luce-ui" {
+        str owner = "dymokomi"
+        str path = "../luce-ui"
+    }
+
+    def dependency "luce-audio" {
+        str owner = "dymokomi"
+        str path = "../luce-audio"
+    }
+
+    def dependency "luce-prism" {
+        str owner = "dymokomi"
+        str path = "../luce-prism"
+    }
+
+    def dependency "luce-color" {
+        str owner = "dymokomi"
+        str path = "../luce-color"
+    }
+
+    def dependency "luce-std" {
+        str owner = "dymokomi"
+        str path = "../luce-std"
+    }
+
+    def dependency "luce-gpu" {
+        str owner = "dymokomi"
+        str path = "../luce-gpu"
+    }
+
+    def dependency "luce-window" {
+        str owner = "dymokomi"
+        str path = "../luce-window"
+    }
+
+    def dependency "luce-clipboard" {
+        str owner = "dymokomi"
+        str path = "../luce-clipboard"
+    }
+}

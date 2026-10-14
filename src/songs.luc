@@ -1,0 +1,909 @@
+## Style studies: original songs written after the records of Com Truise,
+## Tycho, Makeup and Vanity Set, Kavinsky and Rival Consoles — their
+## tempos, harmony, drum feels, patches and effect chains (see
+## reports/Synthwave artist production techniques.md), none of their
+## melodies. Each is arranged in sections, a clip per part per section.
+from song import Song, Track, Lane, Clip, Note, Point, GraphNode
+import presets
+import catalog
+
+# ---------------------------------------------------------------- writing notes
+
+## Notes being written: (beat, length, pitch, velocity), on the song's
+## timeline in beats.
+pub class Score:
+    pub var notes: list[(float, float, int, float)]
+
+    func init(self):
+        self.notes = []
+
+    func add(self, beat: float, length: float, pitch: int, velocity: float):
+        self.notes.append((beat, length, pitch, velocity))
+
+    func chord(self, beat: float, length: float, pitches: list[int], velocity: float):
+        for pitch in pitches:
+            self.notes.append((beat, length, pitch, velocity))
+
+    ## Hits from a step pattern, sixteen steps a bar ("X" loud, "x" played,
+    ## "o" a ghost, "." rest, separated by spaces), for `bars` bars from
+    ## `bar`. Swing pushes every second sixteenth late (0.5 straight).
+    func steps(self, text: str, bar: int, bars: int, pitch: int, swing: float = 0.5, length: float = 0.15, level: float = 1.0):
+        let marks = text.split(" ").filter((mark) => mark != "")
+        let per_bar = marks.length
+        for b in 0..<bars:
+            for at in 0..<per_bar:
+                let mark = marks[at]
+                var velocity = 0.0
+                if mark == "X": velocity = 1.0
+                elif mark == "x": velocity = 0.75
+                elif mark == "o": velocity = 0.38
+                if velocity == 0.0: continue
+                var beat = float((bar + b) * 4) + 4.0 * float(at) / float(per_bar)
+                if at % 2 == 1:
+                    beat += (swing - 0.5) * 0.5
+                # A breath of variation, as hands (and Elektron's) give.
+                let wobble = 0.94 + 0.06 * float((at * 7 + b * 3) % 5) / 4.0
+                self.add(beat, length, pitch, velocity * wobble * level)
+
+    ## Chords held `each` bars apiece, in order, for `bars` bars from `bar`.
+    func pads(self, chords: list[list[int]], bar: int, bars: int, each: int = 2, velocity: float = 0.6, gap: float = 0.1):
+        var at = 0
+        while at < bars:
+            let chord = chords[(at // each) % chords.length]
+            self.chord(float((bar + at) * 4), float(each * 4) - gap, chord, velocity)
+            at += each
+
+    ## An arpeggio: `order` indexes into each chord (an index past its end
+    ## climbs an octave), one note every `step` beats, `each` bars a chord.
+    func arp(self, chords: list[list[int]], bar: int, bars: int, order: list[int], step: float, each: int = 2,
+             velocity: float = 0.7, length: float = 0.0, accents: list[float] = []):
+        let total = float(bars * 4)
+        var t = 0.0
+        var k = 0
+        while t < total - 0.001:
+            let chord = chords[(int(t) // (each * 4)) % chords.length]
+            let index = order[k % order.length]
+            let pitch = chord[index % chord.length] + 12 * (index // chord.length)
+            let accent = accents[k % accents.length] if accents.length > 0 else 1.0
+            self.add(float(bar * 4) + t, length if length > 0.0 else step * 0.8, pitch, velocity * accent)
+            t += step
+            k += 1
+
+    ## A line given as (beat in the phrase, length, pitch), repeated every
+    ## `period` beats from `bar` for `times`.
+    func phrase(self, line: list[(float, float, int)], bar: int, times: int, period: float, velocity: float = 0.75, shift: int = 0):
+        for time in 0..<times:
+            for (beat, length, pitch) in line:
+                self.add(float(bar * 4) + float(time) * period + beat, length, pitch + shift, velocity)
+
+# ---------------------------------------------------------------- arranging
+
+## A song being arranged: parts (tracks of an instrument through effects),
+## sections, the clips of each part cut at the sections.
+pub class Studio:
+    pub let song: Song
+    pub var sections: list[(str, int)]
+
+    func init(self, name: str, tempo: float, master: float = -2.0):
+        self.song = Song()
+        self.song.name = name
+        self.song.tempo = tempo
+        self.song.loop_on = false
+        self.song.master = master
+        self.sections = []
+
+    ## Sections by name and first bar, in order; the last is the end.
+    func section(self, name: str, bar: int):
+        self.sections.append((name, bar))
+
+    func part(self, name: str, instrument: str, effects: list[str], volume: float = 0.0, pan: float = 0.0) -> Lane:
+        return presets.instrument_track(self.song, name, instrument, effects, volume, pan)
+
+    func track_of(self, lane: Lane) -> Track:
+        for track in self.song.tracks:
+            if track.lane(lane.id) != none:
+                return track
+        trap("a lane of no track")
+
+    ## A drum track: a lane per (name, instrument), all through `bus` in order.
+    func kit(self, name: str, drums: list[(str, str)], bus: list[str], volume: float = 0.0) -> list[Lane]:
+        let track = self.song.add_track(name)
+        track.volume = volume
+        let lanes: list[Lane] = []
+        for at in 0..<drums.length:
+            lanes.append(presets.drum_lane(self.song, track, drums[at].0, drums[at].1, at))
+        if bus.length > 0:
+            if let out = self.song.output_of(track):
+                track.rack.wires = track.rack.wires.filter((w) => w.target != out.id)
+                let devices = track.rack.nodes.filter((node) => node.kind == catalog.device_kind)
+                var last: GraphNode? = none
+                var x = 520.0
+                for effect in bus:
+                    let next = presets.make(self.song, effect, x, 120.0)
+                    track.rack.nodes.append(next)
+                    if let previous = last:
+                        presets.patch_rack(track, previous, 0, next, catalog.device_audio)
+                    else:
+                        for device in devices:
+                            presets.patch_rack(track, device, 0, next, catalog.device_audio)
+                    last = next
+                    x += 240.0
+                out.x = x
+                if let final = last:
+                    presets.patch_rack(track, final, 0, out, catalog.output_audio)
+        return lanes
+
+    ## Set `settings` on every `kind` node inside the device `device` on
+    ## `lane`'s track (the first device of that name).
+    func tweak(self, lane: Lane, device: str, kind: str, settings: map[str, float]):
+        let track = self.track_of(lane)
+        for node in track.rack.nodes:
+            if node.name != device or node.kind != catalog.device_kind:
+                continue
+            if let patch = node.patch:
+                for inner in patch.nodes:
+                    if inner.name != kind:
+                        continue
+                    let infos = catalog.params(inner.kind)
+                    for (name, value) in settings:
+                        for at in 0..<infos.length:
+                            if infos[at].name == name:
+                                inner.params[at] = value
+            return
+
+    ## A part's notes, cut into a clip per section it plays in.
+    func write(self, lane: Lane, score: Score):
+        for at in 0..<self.sections.length - 1:
+            let (name, first) = self.sections[at]
+            let start = float(first * 4)
+            let end = float(self.sections[at + 1].1 * 4)
+            let inside = score.notes.filter((n) => n.0 >= start - 0.001 and n.0 < end - 0.001)
+            if inside.length == 0:
+                continue
+            let clip = Clip(self.song.next_id(), name, start, end - start)
+            for (beat, length, pitch, velocity) in inside:
+                clip.notes.append(Note(start = beat - start, length = length, pitch = pitch, velocity = velocity))
+            lane.clips.append(clip)
+
+    ## A curve on `lane`'s track driving the device `device`'s Control In 1:
+    ## (beat, value 0..1) points, a line between each.
+    func sweep(self, lane: Lane, device: str, name: str, points: list[(float, float)]):
+        let track = self.track_of(lane)
+        let curve = self.song.add_lane(track, name, true)
+        for node in track.rack.nodes:
+            if node.name == device and node.kind == catalog.device_kind:
+                if let source = self.song.lane_node(track, curve.id):
+                    presets.patch_rack(track, source, 0, node, catalog.device_control)
+                break
+        let end = points[points.length - 1].0
+        let clip = Clip(self.song.next_id(), name, 0.0, end)
+        for (beat, value) in points:
+            clip.points.append(Point(beat = beat, value = value, shape = 0))
+        curve.clips.append(clip)
+
+    ## The song's master bus: the mastering chain, driven `input` dB into
+    ## its limiter (the loudness).
+    func master(self, input: float):
+        # The chain holds the ceiling; nothing after it.
+        self.song.master = 0.0
+        let track = self.song.master_track()
+        let chain = presets.make(self.song, "Master", 260.0, 30.0)
+        track.rack.nodes.append(chain)
+        if let out = self.song.output_of(track):
+            presets.patch_rack(track, chain, 0, out, catalog.output_audio)
+        if let patch = chain.patch:
+            for inner in patch.nodes:
+                if inner.name == "Limiter":
+                    let infos = catalog.params(inner.kind)
+                    for at in 0..<infos.length:
+                        if infos[at].name == "Input":
+                            inner.params[at] = input
+
+## Seconds of echo for `beats` at `tempo`.
+func beats(count: float, tempo: float) -> float:
+    return count * 60.0 / tempo
+
+# ---------------------------------------------------------------- Com Truise
+
+## "Cathode Haze", after Com Truise: slow-motion funk at 86, F minor with a
+## Dorian lean. A half-time beat of layered LinnDrum-style hits squeezed,
+## driven and frequency-shifted, a gated snare; a monster square bass
+## pumping on the beat; Juno stabs on the offbeats; an Xpander pad through
+## a slow phaser into a dark hall; a dotted-eighth Prophet pluck in
+## ping-pong; a bright gliding lead; every part skewed by its own drift and
+## a tape machine.
+pub func cathode_haze() -> Song:
+    let tempo = 86.0
+    let s = Studio("Cathode Haze", tempo, -1.0)
+    s.section("Intro", 0)
+    s.section("A", 8)
+    s.section("B", 24)
+    s.section("Break", 40)
+    s.section("A again", 48)
+    s.section("Outro", 64)
+    s.section("End", 72)
+    let a_chords = [[56, 60, 63, 67], [49, 53, 56, 60], [56, 60, 61, 65], [55, 58, 60, 65]]
+    let a_roots = [41, 37, 34, 36]
+    let b_chords = [[53, 56, 60, 63], [51, 53, 58, 63], [51, 55, 58, 60], [53, 55, 56, 60]]
+    let b_roots = [37, 39, 36, 41]
+
+    # Drums: kick and hats in the kit, the snare and clap with their own gated room.
+    let kit = s.kit("Drums", [("Kick", "Linn Kick"), ("Hat", "Linn Hat"), ("Open Hat", "Linn Open Hat"), ("Toms", "Linn Tom")],
+                    ["Drum Bus", "Freq Shift", "Tape Deck"], -1.0)
+    s.tweak(kit[0], "Freq Shift", "Freq Shifter", {"Shift": 3.0, "Mix": 0.25})
+    let snare = s.part("Snare", "Linn Snare", ["Gated Hall", "Drum Bus"], 0.0)
+    let clap = s.part("Clap", "Linn Clap", ["Gated Hall"], -5.0, 0.1)
+    let kicks = Score()
+    let hats = Score()
+    let opens = Score()
+    let toms = Score()
+    let snares = Score()
+    let swing = 0.56
+    for (first, count) in [(8, 32), (48, 16)]:
+        kicks.steps("X . . . . . x . . . o . . . . .", first, count, 60, swing)
+        hats.steps("x x X x x x X x x x X x x x X x", first, count, 60, swing, 0.08, 0.7)
+        opens.steps(". . . . . . . . . . . . . . x .", first, count, 60, swing, 0.3)
+        snares.steps(". . . . . . . . X . . . . . . .", first, count, 60, swing)
+        # A tom run closing every fourth bar, falling across the kit.
+        var bar = first + 3
+        while bar < first + count:
+            for (step, pitch) in [(12, 64), (13, 60), (14, 57), (15, 53)]:
+                toms.add(float(bar * 4) + float(step) * 0.25, 0.2, pitch, 0.7 + 0.05 * float(step - 12))
+            bar += 4
+    # The break: only the toms, sparse, far away.
+    toms.steps("x . . . . . . . . . x . . . . .", 40, 8, 55, swing, 0.3, 0.6)
+    s.write(kit[0], kicks)
+    s.write(kit[1], hats)
+    s.write(kit[2], opens)
+    s.write(kit[3], toms)
+    s.write(snare, snares)
+    s.write(clap, snares)
+
+    # The monster bass: sixteenths around root, octave and fifth, pumping.
+    let bass = s.part("Bass", "Monster Bass", ["EQ", "Pump", "Tape Deck"], -4.0)
+    s.tweak(bass, "EQ", "EQ", {"Low Cut": 28.0, "Mid 1 Freq": 210.0, "Mid 1 Gain": 3.0, "Mid 2 Freq": 500.0, "Mid 2 Gain": -3.0, "Mid 2 Q": 1.4})
+    s.tweak(bass, "Pump", "Pump", {"Rate": 2.0, "Depth": 0.8, "Release": 0.55, "Curve": 2.0})
+    let lows = Score()
+    let figure: list[(float, float, int)] = [(0.0, 0.4, 0), (0.75, 0.2, 0), (1.5, 0.2, 12), (2.0, 0.4, 0), (2.75, 0.2, 7), (3.25, 0.2, 12), (3.5, 0.4, 0)]
+    for (first, count, roots) in [(8, 16, a_roots), (24, 16, b_roots), (48, 16, a_roots)]:
+        for bar in 0..<count:
+            let root = roots[(bar // 2) % 4]
+            for (beat, length, step) in figure:
+                lows.add(float((first + bar) * 4) + beat, length, root + step, 0.85 if beat == 0.0 else 0.65)
+    s.write(bass, lows)
+
+    # Juno stabs on the offbeats.
+    let stabs = s.part("Stabs", "Juno Stab", ["Juno Chorus", "Tape Echo", "Pump", "Cassette"], -1.0, -0.2)
+    s.tweak(stabs, "Tape Echo", "Echo", {"Mode": 2.0, "Time": beats(1.0, tempo), "Feedback": 0.3, "Mix": 0.22})
+    s.tweak(stabs, "Pump", "Pump", {"Depth": 0.4})
+    let hits = Score()
+    for (first, count, chords) in [(8, 16, a_chords), (24, 16, b_chords), (48, 16, a_chords)]:
+        for bar in 0..<count:
+            let chord = chords[(bar // 2) % 4]
+            for beat in [0.5, 1.75, 2.5, 3.5]:
+                hits.chord(float((first + bar) * 4) + beat, 0.2, chord, 0.75 if beat == 0.5 else 0.6)
+    s.write(stabs, hits)
+
+    # The pad: the whole song, swelling under everything.
+    let pad = s.part("Pad", "Xpander Pad", ["Phaser", "Juno Chorus", "Hall", "Pump", "Cassette"], -4.0, 0.15)
+    s.tweak(pad, "Phaser", "Phaser", {"Rate": 0.15, "Mix": 0.35})
+    s.tweak(pad, "Hall", "Hall", {"Decay": 5.5, "Damping": 2500.0, "Mix": 0.4})
+    s.tweak(pad, "Pump", "Pump", {"Depth": 0.3})
+    let pads = Score()
+    pads.pads(a_chords, 0, 24)
+    pads.pads(b_chords, 24, 16)
+    pads.pads(a_chords, 40, 32)
+    s.write(pad, pads)
+
+    # The pluck: dotted eighths over the chord tones, in ping-pong, opening up.
+    let pluck = s.part("Pluck", "Prophet Pluck", ["BBD Echo", "Cassette"], 3.0, 0.3)
+    s.tweak(pluck, "BBD Echo", "Echo", {"Time": beats(0.75, tempo), "Feedback": 0.55, "Mix": 0.3})
+    let plucks = Score()
+    plucks.arp(a_chords, 0, 8, [0, 2, 3, 5, 3, 2], 0.75, velocity = 0.6)
+    plucks.arp(a_chords, 40, 8, [0, 2, 3, 5, 3, 2], 0.75, velocity = 0.7)
+    plucks.arp(a_chords, 48, 24, [0, 2, 3, 5, 3, 2], 0.75, velocity = 0.65)
+    s.write(pluck, plucks)
+    s.sweep(pluck, "Prophet Pluck", "Pluck Cutoff", [(0.0, 0.1), (32.0, 0.5), (160.0, 0.35), (192.0, 0.8), (288.0, 0.2)])
+
+    # The lead: long notes on the phrase downbeats, F minor pentatonic with
+    # the Dorian sixth.
+    let lead = s.part("Lead", "Truise Lead", ["Juno Chorus", "Tape Echo", "Hall", "Cassette"], 4.0, -0.05)
+    s.tweak(lead, "Tape Echo", "Echo", {"Time": 0.3, "Feedback": 0.5, "Mix": 0.25})
+    s.tweak(lead, "Hall", "Hall", {"Decay": 4.0, "Mix": 0.3})
+    let melody = Score()
+    let line: list[(float, float, int)] = [(0.0, 3.5, 72), (4.0, 1.5, 75), (5.5, 0.5, 77), (6.0, 6.0, 74),
+                                           (16.0, 3.0, 79), (19.0, 1.0, 77), (20.0, 2.0, 75), (22.0, 2.0, 72), (24.0, 7.5, 70)]
+    melody.phrase(line, 24, 2, 32.0)
+    melody.phrase(line, 48, 2, 32.0, shift = 12, velocity = 0.7)
+    s.write(lead, melody)
+    s.master(5.5)
+    return s.song
+
+# ---------------------------------------------------------------- Tycho
+
+## "Coastal Drift", after Tycho: 96 in D major, a vi–IV–I–V loop built of
+## open stacked voicings, a loose kit squeezed hard and taped, a round
+## ladder bass, a Rhodes standing in for the chorused guitar, a Juno arp
+## climbing into reverb with the echo after it, a pad run reverb → drive →
+## filter → plate → echo, a triangle lead singing over it.
+pub func coastal_drift() -> Song:
+    let tempo = 96.0
+    let s = Studio("Coastal Drift", tempo, -1.0)
+    s.section("Intro", 0)
+    s.section("A", 8)
+    s.section("A lead", 24)
+    s.section("Break", 32)
+    s.section("B", 40)
+    s.section("A again", 56)
+    s.section("Outro", 72)
+    s.section("End", 80)
+    let a_chords = [[50, 54, 57, 61], [50, 54, 55, 59], [50, 54, 57, 62], [52, 57, 59, 64]]
+    let a_roots = [35, 43, 42, 45]
+    let b_chords = [[50, 54, 55, 59], [49, 52, 57, 61], [49, 52, 54, 57], [50, 54, 57, 62],
+                    [50, 54, 55, 59], [49, 54, 55, 59], [52, 57, 59, 64], [52, 57, 61, 64]]
+    let b_roots = [43, 45, 42, 35, 40, 43, 45, 45]
+
+    let kit = s.kit("Drums", [("Kick", "Linn Kick"), ("Hat", "Linn Hat"), ("Open Hat", "Linn Open Hat"), ("Toms", "Linn Tom")],
+                    ["Drum Bus", "EQ"], -2.0)
+    s.tweak(kit[0], "EQ", "EQ", {"High Cut": 12000.0, "Low Gain": 2.0, "Low Freq": 80.0})
+    let snare = s.part("Snare", "Linn Snare", ["Plate", "Drum Bus"], -1.0)
+    s.tweak(snare, "Plate", "Plate", {"Decay": 1.2, "Mix": 0.15})
+    let shaker = s.part("Shaker", "Shaker", ["Tape Deck"], -8.0, 0.3)
+    let kicks = Score()
+    let hats = Score()
+    let opens = Score()
+    let toms = Score()
+    let snares = Score()
+    let shakes = Score()
+    for (first, count) in [(8, 24), (40, 32)]:
+        kicks.steps("X . . . . . . o . . x . . . . .", first, count, 60, 0.53)
+        snares.steps(". . . . X . o . . . . . X . o .", first, count, 60, 0.53)
+        hats.steps("x . X . x . X . x . X x x . X x", first, count, 60, 0.53, 0.08, 0.8)
+        shakes.steps("x o x o x o x o x o x o x o x o", first, count, 60, 0.53, 0.1, 0.8)
+        var bar = first + 7
+        while bar < first + count:
+            for (step, pitch) in [(12, 67), (13, 64), (14, 60), (15, 55)]:
+                toms.add(float(bar * 4) + float(step) * 0.25, 0.2, pitch, 0.8)
+            opens.add(float(bar * 4) + 3.5, 0.4, 60, 0.6)
+            bar += 8
+    # The intro: the kit faint and far, the hats only.
+    hats.steps("x . x . x . x . x . x . x . x .", 4, 4, 60, 0.53, 0.08, 0.45)
+    s.write(kit[0], kicks)
+    s.write(kit[1], hats)
+    s.write(kit[2], opens)
+    s.write(kit[3], toms)
+    s.write(snare, snares)
+    s.write(shaker, shakes)
+
+    let bass = s.part("Bass", "Moog Bass", ["Heat", "EQ", "Glue"], -5.0)
+    s.tweak(bass, "EQ", "EQ", {"High Cut": 5000.0})
+    let lows = Score()
+    for (first, count, roots, each) in [(8, 24, a_roots, 1), (40, 16, b_roots, 1), (56, 16, a_roots, 1)]:
+        for bar in 0..<count:
+            let root = roots[(bar // each) % roots.length]
+            let base = float((first + bar) * 4)
+            for (beat, step) in [(0.0, 0), (1.0, 0), (1.5, 12), (2.0, 7), (3.0, 0), (3.5, 5 if bar % 2 == 1 else 0)]:
+                lows.add(base + beat, 0.45, root + step, 0.8 if beat == 0.0 else 0.6)
+    s.write(bass, lows)
+
+    # The pad, the reverb first, then drive, a dark filter, a plate and the echo.
+    let pad = s.part("Pad", "OB Pad", ["Hall", "Heat", "EQ", "Plate", "Tape Echo", "Tape Deck"], -2.0)
+    s.tweak(pad, "Hall", "Hall", {"Decay": 5.0, "Mix": 0.5})
+    s.tweak(pad, "EQ", "EQ", {"Low Cut": 150.0, "High Cut": 3000.0})
+    s.tweak(pad, "Plate", "Plate", {"Decay": 2.0, "Mix": 0.3})
+    s.tweak(pad, "Tape Echo", "Echo", {"Time": beats(0.75, tempo), "Feedback": 0.3, "Mix": 0.2})
+    s.tweak(pad, "Tape Deck", "Tape", {"Wow": 0.3, "Hiss": -58.0})
+    let pads = Score()
+    pads.pads(a_chords, 0, 40, 1, 0.55, 0.05)
+    pads.pads(b_chords, 40, 16, 1, 0.6, 0.05)
+    pads.pads(a_chords, 56, 24, 1, 0.55, 0.05)
+    s.write(pad, pads)
+
+    # The chord bed, stacked single voices into a Space Echo.
+    let bed = s.part("Chord Bed", "Stacked Mono", ["Tape Echo", "Plate"], -2.0, -0.3)
+    s.tweak(bed, "Tape Echo", "Echo", {"Time": beats(1.0, tempo), "Feedback": 0.35, "Mix": 0.3})
+    let beds = Score()
+    for (first, count, chords) in [(24, 8, a_chords), (40, 16, b_chords), (56, 16, a_chords)]:
+        for bar in 0..<count:
+            let chord = chords[bar % chords.length]
+            beds.chord(float((first + bar) * 4), 1.5, [chord[0] + 12, chord[2] + 12, chord[3] + 12], 0.55)
+            beds.chord(float((first + bar) * 4) + 2.5, 1.0, [chord[0] + 12, chord[2] + 12, chord[3] + 12], 0.45)
+    s.write(bed, beds)
+
+    # The Rhodes plays the guitar's part: muted eighths, chorused, echoed.
+    let keys = s.part("Rhodes", "Rhodes Suitcase", ["Ensemble", "Tape Echo"], 0.0, 0.35)
+    s.tweak(keys, "Tape Echo", "Echo", {"Time": beats(0.75, tempo), "Feedback": 0.4, "Mix": 0.25})
+    let picks = Score()
+    picks.arp(a_chords, 8, 24, [0, 2, 1, 3, 2, 1, 3, 2], 0.5, 1, 0.5, 0.3)
+    picks.arp(a_chords, 32, 8, [3, 5], 2.0, 1, 0.5, 1.8)
+    picks.arp(a_chords, 56, 24, [0, 2, 1, 3, 2, 1, 3, 2], 0.5, 1, 0.5, 0.3)
+    s.write(keys, picks)
+
+    # The Juno arp: sixteenths over two octaves, into the hall, echo after.
+    let arp = s.part("Arp", "Juno Arp", ["Juno Chorus", "Hall", "Tape Echo"], 0.0, -0.2)
+    s.tweak(arp, "Hall", "Hall", {"Decay": 3.0, "Mix": 0.35})
+    s.tweak(arp, "Tape Echo", "Echo", {"Time": beats(0.75, tempo), "Feedback": 0.3, "Mix": 0.15})
+    let arps = Score()
+    arps.arp(a_chords, 8, 24, [0, 1, 2, 3, 4, 5, 6, 7, 6, 5, 4, 3, 2, 1], 0.25, 1, 0.55)
+    arps.arp(b_chords, 40, 16, [0, 1, 2, 3, 4, 5, 6, 7, 6, 5, 4, 3, 2, 1], 0.25, 1, 0.6)
+    arps.arp(a_chords, 56, 16, [0, 1, 2, 3, 4, 5, 6, 7, 6, 5, 4, 3, 2, 1], 0.25, 1, 0.55)
+    s.write(arp, arps)
+    s.sweep(arp, "Juno Arp", "Arp Cutoff", [(0.0, 0.0), (32.0, 0.2), (128.0, 0.6), (160.0, 0.3), (224.0, 0.9), (288.0, 0.5), (320.0, 0.1)])
+
+    # The lead: stepwise, mostly chord tones, long notes at the phrase ends.
+    let lead = s.part("Lead", "Mini Lead", ["EQ", "Plate", "Hall", "Tape Echo", "Glue"], -3.0)
+    s.tweak(lead, "EQ", "EQ", {"Low Cut": 300.0, "High Cut": 6000.0, "Mid 2 Freq": 2500.0, "Mid 2 Gain": 3.0})
+    s.tweak(lead, "Plate", "Plate", {"Mix": 0.15})
+    s.tweak(lead, "Hall", "Hall", {"Decay": 4.0, "Mix": 0.3, "Mod Depth": 0.8})
+    s.tweak(lead, "Tape Echo", "Echo", {"Time": beats(1.0, tempo), "Feedback": 0.3, "Mix": 0.15})
+    let melody = Score()
+    let line: list[(float, float, int)] = [(0.0, 1.5, 73), (1.5, 0.5, 71), (2.0, 2.0, 69), (4.0, 1.0, 66), (5.0, 1.0, 69), (6.0, 2.0, 71),
+                                           (8.0, 3.0, 74), (11.0, 1.0, 73), (12.0, 2.0, 71), (14.0, 2.0, 69),
+                                           (16.0, 1.5, 66), (17.5, 0.5, 69), (18.0, 2.0, 71), (20.0, 4.0, 69),
+                                           (24.0, 2.0, 73), (26.0, 2.0, 74), (28.0, 3.5, 76)]
+    melody.phrase(line, 24, 1, 32.0)
+    melody.phrase(line, 40, 2, 32.0, shift = 12, velocity = 0.7)
+    melody.phrase(line, 56, 2, 32.0)
+    s.write(lead, melody)
+    s.master(4.0)
+    return s.song
+
+# ---------------------------------------------------------------- Makeup and Vanity Set
+
+## "Night Signal", after Makeup and Vanity Set: a dark score cue at 104 in
+## D minor. A pedal bass ostinato and a Mother-32 style arpeggio slowly
+## opening, a cold DX bell motif, a drone under VHS wobble, half-time Rytm
+## drums with a gated snare, and the Cathedral — the Mercury7-like hall
+## everything melts into; a Phrygian break of D and E♭ over the pedal.
+pub func night_signal() -> Song:
+    let tempo = 104.0
+    let s = Studio("Night Signal", tempo, -1.0)
+    s.section("Intro", 0)
+    s.section("A1", 8)
+    s.section("A2", 24)
+    s.section("B", 40)
+    s.section("Break", 56)
+    s.section("A3", 64)
+    s.section("Outro", 80)
+    s.section("End", 90)
+    let a_chords = [[50, 53, 57, 64], [46, 50, 53, 57], [53, 57, 58, 62], [52, 55, 57, 62]]
+    let a_roots = [38, 34, 31, 33]
+    let b_chords = [[50, 53, 58, 62], [48, 53, 57, 60], [50, 55, 58, 62], [48, 52, 55, 60],
+                    [50, 53, 58, 62], [48, 52, 55, 60], [50, 53, 57, 64], [50, 53, 57, 64]]
+    let b_roots = [34, 33, 31, 36, 34, 36, 38, 38]
+    let dread = [[50, 53, 57, 62], [51, 55, 58, 63]]
+
+    let drone = s.part("Drone", "Drone", ["VHS", "Cathedral"], -4.0)
+    s.tweak(drone, "Cathedral", "Hall", {"Mix": 0.5})
+    let drones = Score()
+    drones.add(0.0, float(88 * 4), 26, 0.6)
+    drones.add(0.0, float(88 * 4), 38, 0.5)
+    s.write(drone, drones)
+    s.sweep(drone, "Drone", "Drone Filter", [(0.0, 0.0), (64.0, 0.6), (128.0, 0.2), (224.0, 0.8), (256.0, 0.3), (320.0, 0.9), (352.0, 0.0)])
+
+    let bass = s.part("Bass", "Pedal Bass", ["EQ", "Plate", "Glue"], -3.0)
+    s.tweak(bass, "EQ", "EQ", {"Low Cut": 30.0, "High Cut": 6000.0})
+    s.tweak(bass, "Plate", "Plate", {"Mix": 0.1, "Decay": 1.2})
+    let lows = Score()
+    let ostinato = [0, 0, 12, 0, 10, 0, 12, 7]
+    for (first, count, roots) in [(8, 32, a_roots), (40, 16, b_roots), (64, 16, a_roots)]:
+        for bar in 0..<count:
+            let root = roots[(bar // 2) % roots.length]
+            for k in 0..<8:
+                lows.add(float((first + bar) * 4) + 0.5 * float(k), 0.48, root + ostinato[k], 0.85 if k == 0 or k == 3 else 0.65)
+    for bar in 56..<64:
+        for k in 0..<8:
+            lows.add(float(bar * 4) + 0.5 * float(k), 0.48, 38 + (1 if bar % 2 == 1 and k == 4 else 0), 0.6)
+    s.write(bass, lows)
+
+    let arp = s.part("Arp", "Mother Arp", ["BBD Echo", "Cathedral", "Wide"], 0.0, 0.0)
+    s.tweak(arp, "BBD Echo", "Echo", {"Time": beats(0.75, tempo), "Feedback": 0.35, "Mix": 0.3, "Tone": 3000.0})
+    s.tweak(arp, "Cathedral", "Hall", {"Mix": 0.35})
+    let arps = Score()
+    let figure = [0, 7, 12, 15, 12, 7, 14, 7]
+    for (first, count, roots) in [(8, 32, a_roots), (40, 16, b_roots), (56, 8, [38, 38]), (64, 16, a_roots)]:
+        var k = 0
+        for bar in 0..<count:
+            let root = roots[(bar // 2) % roots.length] + 24
+            for step in 0..<16:
+                let pitch = root + figure[step % 8] + (1 if first == 56 and bar % 2 == 1 and figure[step % 8] == 0 else 0)
+                arps.add(float((first + bar) * 4) + 0.25 * float(step), 0.2, pitch, 0.9 if step % 4 == 0 else 0.6)
+                # Every fourth bar, a ratchet on the last step.
+                if bar % 4 == 3 and step == 15:
+                    arps.add(float((first + bar) * 4) + 3.875, 0.1, pitch + 12, 0.5)
+                k += 1
+    s.write(arp, arps)
+    s.sweep(arp, "Mother Arp", "Arp Cutoff", [(0.0, 0.0), (32.0, 0.0), (160.0, 0.45), (224.0, 0.85), (256.0, 0.3), (320.0, 0.9), (352.0, 0.2)])
+
+    let bell = s.part("Bell", "DX Glass", ["Tape Echo", "Cathedral"], 6.0, -0.25)
+    s.tweak(bell, "Tape Echo", "Echo", {"Mode": 2.0, "Time": beats(1.0, tempo), "Feedback": 0.25, "Mix": 0.3})
+    let bells = Score()
+    let motif: list[(float, float, int)] = [(0.0, 1.0, 74), (1.5, 1.0, 69), (3.0, 2.0, 72), (6.0, 1.0, 67), (8.0, 4.0, 69),
+                                            (16.0, 1.0, 74), (17.5, 1.0, 76), (19.0, 2.0, 77), (22.0, 1.0, 72), (24.0, 6.0, 74)]
+    bells.phrase(motif, 24, 2, 32.0, 0.6)
+    bells.phrase(motif, 64, 2, 32.0, 0.6, shift = 12)
+    s.write(bell, bells)
+
+    let pad = s.part("Pad", "Xpander Pad", ["Juno Chorus", "Cathedral"], -6.0)
+    let pads = Score()
+    pads.pads(a_chords, 0, 40)
+    pads.pads(b_chords, 40, 16)
+    pads.pads(dread, 56, 8, 1)
+    pads.pads(a_chords, 64, 24)
+    s.write(pad, pads)
+
+    let kit = s.kit("Drums", [("Kick", "Rytm Kick"), ("Hat", "Rytm Hat"), ("Toms", "Linn Tom")], ["Drum Bus"], 2.0)
+    let snare = s.part("Snare", "Rytm Snare", ["Gated Hall", "Cathedral"], 10.0)
+    s.tweak(snare, "Cathedral", "Hall", {"Mix": 0.25})
+    let kicks = Score()
+    let hats = Score()
+    let snares = Score()
+    let toms = Score()
+    for (first, count) in [(24, 32), (64, 16)]:
+        kicks.steps("X . . . . . . . . . x . . . . .", first, count, 60)
+        snares.steps(". . . . . . . . X . . . . . . .", first, count, 60)
+        hats.steps(". . x . . . X . . . x . . . X .", first, count, 60, 0.5, 0.08)
+    # The break: low toms in eighths, sinking.
+    for bar in 56..<64:
+        for k in 0..<8:
+            toms.add(float(bar * 4) + 0.5 * float(k), 0.4, 52 - (k % 4), 0.55 + 0.04 * float(bar - 56))
+    s.write(kit[0], kicks)
+    s.write(kit[1], hats)
+    s.write(kit[2], toms)
+    s.write(snare, snares)
+
+    # A counter-line in B, doubled an octave up for the climax.
+    let lead = s.part("Lead", "Model D", ["BBD Echo", "Cathedral"], 0.0, 0.1)
+    s.tweak(lead, "BBD Echo", "Echo", {"Time": beats(0.75, tempo), "Feedback": 0.4, "Mix": 0.25})
+    let lines = Score()
+    let counter: list[(float, float, int)] = [(0.0, 2.0, 69), (2.0, 2.0, 70), (4.0, 4.0, 72), (8.0, 2.0, 74), (10.0, 2.0, 72), (12.0, 3.5, 70)]
+    lines.phrase(counter, 40, 4, 16.0, 0.7)
+    lines.phrase(counter, 64, 4, 16.0, 0.75)
+    lines.phrase(counter, 64, 4, 16.0, 0.55, shift = 12)
+    s.write(lead, lines)
+    s.master(3.5)
+    return s.song
+
+# ---------------------------------------------------------------- Kavinsky
+
+## "Night Interceptor", after Kavinsky: a half-time night drive at 96 in E
+## minor. Slash-chord verses over a walking bass (E E F♯ F♯), a Juno pluck
+## arpeggio in sixteenths, an octave saw bass whose vibrato wakes after the
+## attack, Prophet strings on the choruses with the major V lifting into
+## them, a gated LinnDrum snare and clap, a hard-synced lead screaming in
+## the bridge, a supersaw doubling the last chorus; everything ducks on
+## the beat and runs hot.
+pub func night_interceptor() -> Song:
+    let tempo = 96.0
+    let s = Studio("Night Interceptor", tempo, -1.0)
+    s.section("Intro", 0)
+    s.section("Verse", 8)
+    s.section("Chorus", 24)
+    s.section("Verse 2", 32)
+    s.section("Chorus 2", 40)
+    s.section("Bridge", 48)
+    s.section("Last Chorus", 56)
+    s.section("Outro", 72)
+    s.section("End", 80)
+    let verse = [[55, 59, 64], [55, 60, 64], [54, 57, 62], [54, 59, 62]]
+    let verse_roots = [40, 40, 42, 42]
+    let chorus = [[55, 60, 64], [54, 57, 62], [55, 59, 64], [54, 59, 63]]
+    let chorus_roots = [36, 38, 40, 35]
+    let bridge = [[57, 60, 64], [55, 60, 64], [55, 59, 62], [54, 59, 63]]
+    let bridge_roots = [33, 36, 35, 35]
+    let plan: list[(int, int, list[list[int]], list[int], bool)] = [(0, 8, verse, verse_roots, false), (8, 16, verse, verse_roots, false), (24, 8, chorus, chorus_roots, true),
+                                                                    (32, 8, verse, verse_roots, false), (40, 8, chorus, chorus_roots, true), (48, 8, bridge, bridge_roots, false),
+                                                                    (56, 16, chorus, chorus_roots, true), (72, 8, verse, verse_roots, false)]
+
+    let kit = s.kit("Drums", [("Kick", "Linn Kick"), ("Hat", "Linn Hat"), ("Open Hat", "Linn Open Hat"), ("Toms", "Linn Tom")], ["Drum Bus", "Heat"], 2.0)
+    s.tweak(kit[0], "Heat", "Drive", {"Drive": 6.0, "Mix": 0.5})
+    let snare = s.part("Snare", "Linn Snare", ["Gated Hall", "Drum Bus"], 1.0)
+    s.tweak(snare, "Gated Hall", "Hall", {"Gate": 0.2, "Mix": 0.5})
+    let clap = s.part("Clap", "Linn Clap", ["Gated Hall"], 0.0)
+    let kicks = Score()
+    let hats = Score()
+    let opens = Score()
+    let toms = Score()
+    let snares = Score()
+    kicks.steps("X . . . . . . . . . . . . . . .", 4, 4, 60)
+    for (first, count) in [(8, 40), (56, 16)]:
+        kicks.steps("X . . . . . . x . . X . . . . .", first, count, 60, 0.54)
+        snares.steps(". . . . . . . . X . . . . . . .", first, count, 60, 0.54)
+        hats.steps("x . x . x . x . x . x . x . x .", first, count, 60, 0.54, 0.08)
+        opens.steps(". . . . . . . . . . . . . . x .", first, count, 60, 0.54, 0.3)
+    # Fills into each chorus.
+    for bar in [23, 39, 55]:
+        for (step, pitch) in [(8, 67), (10, 64), (12, 60), (13, 60), (14, 55), (15, 55)]:
+            toms.add(float(bar * 4) + float(step) * 0.25, 0.2, pitch, 0.85)
+    s.write(kit[0], kicks)
+    s.write(kit[1], hats)
+    s.write(kit[2], opens)
+    s.write(kit[3], toms)
+    s.write(snare, snares)
+    s.write(clap, snares)
+
+    # The arp runs through everything but the bridge.
+    let arp = s.part("Arp", "Juno Arp", ["Ensemble", "EQ", "Tape Echo", "Pump", "Lo-Fi"], -1.0, -0.15)
+    s.tweak(arp, "EQ", "EQ", {"Mid 2 Freq": 3000.0, "Mid 2 Gain": 3.0, "High Cut": 7000.0})
+    s.tweak(arp, "Tape Echo", "Echo", {"Mode": 2.0, "Time": beats(0.75, tempo), "Feedback": 0.25, "Mix": 0.15})
+    s.tweak(arp, "Pump", "Pump", {"Depth": 0.3})
+    s.tweak(arp, "Lo-Fi", "Lo-Fi", {"Rate": 7000.0, "Bits": 10.0, "Mix": 0.25})
+    let arps = Score()
+    for (first, count, chords, roots, lifted) in plan:
+        if first == 48: continue
+        arps.arp(chords, first, count, [0, 1, 2, 3, 1, 2, 3, 4], 0.25, 1, 0.6 if first > 0 else 0.45)
+    s.write(arp, arps)
+    s.sweep(arp, "Juno Arp", "Arp Cutoff", [(0.0, 0.0), (32.0, 0.4), (96.0, 0.5), (128.0, 0.8), (288.0, 0.9), (320.0, 0.0)])
+
+    # Verses: the octave bass, vibrato waking; choruses: a driven eighth bass.
+    let low = s.part("Verse Bass", "Octave Bass", ["Heat", "Pump"], -2.0)
+    s.tweak(low, "Pump", "Pump", {"Depth": 0.75, "Release": 0.5})
+    let drive = s.part("Chorus Bass", "Moog Bass", ["Heat", "Pump"], -4.0)
+    s.tweak(drive, "Pump", "Pump", {"Depth": 0.85, "Release": 0.45})
+    let lows = Score()
+    let eights = Score()
+    for (first, count, chords, roots, lifted) in plan:
+        if first == 0: continue
+        for bar in 0..<count:
+            let root = roots[bar % 4]
+            if lifted or first == 48:
+                for k in 0..<8:
+                    eights.add(float((first + bar) * 4) + 0.5 * float(k), 0.4, root + (12 if k % 2 == 1 else 0), 0.8)
+            else:
+                lows.add(float((first + bar) * 4), 3.8, root, 0.8)
+    s.write(low, lows)
+    s.write(drive, eights)
+
+    let strings = s.part("Strings", "Prophet Strings", ["Juno Chorus", "Wide", "Hall", "Pump"], -3.0)
+    s.tweak(strings, "Hall", "Hall", {"Decay": 2.5, "Mix": 0.3})
+    s.tweak(strings, "Pump", "Pump", {"Depth": 0.35})
+    let chords = Score()
+    for (first, count, progression, roots, lifted) in plan:
+        if lifted or first == 48:
+            chords.pads(progression, first, count, 1, 0.7, 0.05)
+    s.write(strings, chords)
+
+    # The chorus hook on the supersaw: anthemic, the last time doubled.
+    let hook = s.part("Hook", "Supersaw", ["Juno Chorus", "Hall", "Pump"], 9.0)
+    s.tweak(hook, "Hall", "Hall", {"Decay": 3.0, "Mix": 0.3})
+    s.tweak(hook, "Pump", "Pump", {"Depth": 0.3})
+    let hooks = Score()
+    let line: list[(float, float, int)] = [(0.0, 1.0, 67), (1.0, 1.0, 69), (2.0, 2.0, 71), (4.0, 1.5, 74), (5.5, 0.5, 72), (6.0, 2.0, 71),
+                                           (8.0, 3.0, 72), (11.0, 1.0, 71), (12.0, 2.0, 69), (14.0, 2.0, 67),
+                                           (16.0, 1.0, 64), (17.0, 1.0, 67), (18.0, 2.0, 69), (20.0, 2.0, 71), (22.0, 2.0, 72), (24.0, 6.0, 71)]
+    hooks.phrase(line, 24, 1, 32.0, 0.75)
+    hooks.phrase(line, 40, 1, 32.0, 0.75)
+    hooks.phrase(line, 56, 2, 32.0, 0.8)
+    hooks.phrase(line, 64, 1, 32.0, 0.6, shift = 12)
+    s.write(hook, hooks)
+
+    # The bridge solo: the synced lead tearing upward.
+    let solo = s.part("Solo", "Sync Lead", ["Plate", "BBD Echo"], 7.0, 0.1)
+    s.tweak(solo, "BBD Echo", "Echo", {"Time": beats(0.75, tempo), "Feedback": 0.35, "Mix": 0.2})
+    let solos = Score()
+    let run: list[(float, float, int)] = [(0.0, 0.5, 76), (0.5, 0.5, 79), (1.0, 1.0, 83), (2.0, 0.5, 81), (2.5, 0.5, 79), (3.0, 1.0, 76),
+                                          (4.0, 2.0, 78), (6.0, 2.0, 74), (8.0, 0.5, 76), (8.5, 0.5, 78), (9.0, 1.0, 79), (10.0, 1.0, 81),
+                                          (11.0, 1.0, 83), (12.0, 4.0, 86)]
+    solos.phrase(run, 48, 2, 16.0, 0.85)
+    s.write(solo, solos)
+    s.master(7.1)
+    return s.song
+
+# ---------------------------------------------------------------- Rival Consoles
+
+## "Memory Field", after Rival Consoles' Landscape from Memory: 122,
+## E♭ major / C minor over a B♭ that never leaves. It starts weak — a drone,
+## a single-note Prophet pulse dark behind a 100% wet plate — and grows like
+## a band does: a pad, a muffled broken beat with ice-like ticks, wooden
+## clicks five steps long against the bar, a bass; the parts slip apart;
+## a howling lead drifts in pitch through fuzz and a long tape echo; the
+## drone drops out for two bars, then the wall of tone; then the drums cut
+## and a slowed, wobbling memory of the chords plays out over the drone.
+pub func memory_field() -> Song:
+    let tempo = 122.0
+    let s = Studio("Memory Field", tempo, -1.0)
+    s.section("Weak", 0)
+    s.section("Pad", 16)
+    s.section("Rhythm", 24)
+    s.section("Slip", 48)
+    s.section("Peak", 64)
+    s.section("Coda", 88)
+    s.section("End", 100)
+    let a_chords = [[51, 58, 62, 65], [48, 55, 58, 63], [56, 60, 62, 67], [51, 53, 58, 63]]
+    let b_chords = [[56, 60, 63, 68], [55, 58, 63, 67], [55, 60, 63, 67], [53, 58, 60, 65]]
+    let b_roots = [32, 31, 36, 34]
+
+    let drone = s.part("Drone", "Drone", ["Tape Deck", "Heat", "Plate"], -6.0)
+    s.tweak(drone, "Tape Deck", "Tape", {"Wow": 0.8})
+    s.tweak(drone, "Plate", "Plate", {"Decay": 4.0, "Damping": 0.7, "Mix": 0.3})
+    let drones = Score()
+    drones.add(0.0, float(62 * 4), 46, 0.7)
+    drones.add(0.0, float(62 * 4), 34, 0.6)
+    drones.add(float(64 * 4), float(36 * 4), 46, 0.7)
+    drones.add(float(64 * 4), float(36 * 4), 34, 0.6)
+    s.write(drone, drones)
+    s.sweep(drone, "Drone", "Drone Filter", [(0.0, 0.2), (192.0, 0.5), (256.0, 0.9), (352.0, 0.6), (400.0, 0.1)])
+
+    # The pulse: one B♭, sixteenths, accents opening the filter.
+    let pulse = s.part("Pulse", "Rival Pulse", ["Heat", "Tape Echo", "Plate", "EQ"], -2.0)
+    s.tweak(pulse, "Tape Echo", "Echo", {"Time": beats(0.75, tempo), "Feedback": 0.55, "Drive": 6.0, "Mix": 0.3})
+    s.tweak(pulse, "Plate", "Plate", {"Decay": 2.8, "Mix": 1.0})
+    s.tweak(pulse, "EQ", "EQ", {"Mid 2 Freq": 2500.0, "Mid 2 Gain": 2.0})
+    let pulses = Score()
+    pulses.steps("X o o X o o X o o o X o o X o o", 4, 84, 58, 0.5, 0.18)
+    s.write(pulse, pulses)
+    s.sweep(pulse, "Rival Pulse", "Pulse Cutoff", [(0.0, 0.0), (64.0, 0.05), (256.0, 0.6), (300.0, 0.75), (352.0, 0.9), (360.0, 0.2)])
+
+    let pad = s.part("Pad", "Chord Pad", ["Juno Chorus", "Plate", "Suitcase Tremolo"], -3.0)
+    s.tweak(pad, "Plate", "Plate", {"Decay": 2.0, "Mix": 0.4})
+    s.tweak(pad, "Suitcase Tremolo", "Tremolo", {"Rate": 0.1, "Depth": 0.3})
+    let pads = Score()
+    pads.pads(a_chords, 16, 48)
+    pads.pads(b_chords, 64, 24, 2, 0.8)
+    # At the peak the pad doubles an octave up into a bigger hall.
+    let high = s.part("Pad High", "Chord Pad", ["Cathedral"], -3.0)
+    let highs = Score()
+    var at = 64
+    while at < 88:
+        let chord = b_chords[((at - 64) // 2) % 4]
+        highs.chord(float(at * 4), 7.9, [chord[1] + 12, chord[2] + 12, chord[3] + 12], 0.6)
+        at += 2
+    s.write(pad, pads)
+    s.write(high, highs)
+
+    # The beat: muffled, broken, never four on the floor.
+    let kit = s.kit("Drums", [("Kick", "Rytm Kick"), ("Ice", "Linn Rim"), ("Clicks", "Linn Cowbell"), ("Ride", "Shaker")], ["Lo-Fi", "Drum Bus"], 0.0)
+    s.tweak(kit[0], "Lo-Fi", "Lo-Fi", {"Bits": 11.0, "Rate": 16000.0, "Cutoff": 5000.0, "Mix": 0.5})
+    s.tweak(kit[2], "Linn Cowbell", "Drum Machine", {"Tune": 12.0, "Decay": 0.3})
+    let clap = s.part("Clap", "Rytm Clap", ["Phaser", "BOUM"], 6.0, 0.2)
+    let kicks = Score()
+    let ice = Score()
+    let clicks = Score()
+    let rides = Score()
+    let claps = Score()
+    kicks.steps("x . . . . . . . . . x . . . . .", 24, 64, 60)
+    ice.steps(". . . . x . . . . . . o . . x .", 32, 56, 60)
+    # Five-step clicks against sixteen-step bars: the parts drift apart.
+    var step = 0
+    while step < 40 * 16:
+        clicks.add(float(48 * 4) + 0.25 * float(step), 0.1, 60, 0.5 if step % 10 == 0 else 0.35)
+        step += 5
+    rides.steps("x . x . x . x . x . x . x . x .", 64, 24, 60, 0.5, 0.1, 0.7)
+    claps.steps(". . . . X . . . . . . . X . . .", 64, 24, 60)
+    s.write(kit[0], kicks)
+    s.write(kit[1], ice)
+    s.write(kit[2], clicks)
+    s.write(kit[3], rides)
+    s.write(clap, claps)
+
+    let bass = s.part("Bass", "Moog Bass", ["Heat"], -7.0)
+    let lows = Score()
+    for bar in 32..<64:
+        lows.add(float(bar * 4), 1.5, 34, 0.7)
+        lows.add(float(bar * 4) + 2.5, 1.0, 34 if bar % 4 != 3 else 39, 0.6)
+    for bar in 64..<88:
+        let root = b_roots[((bar - 64) // 2) % 4]
+        for k in 0..<4:
+            lows.add(float(bar * 4) + float(k), 0.9, root, 0.75)
+    s.write(bass, lows)
+
+    # The howl: three to five notes of B♭ pentatonic, sliding, drifting.
+    let howl = s.part("Howl", "Howl Lead", ["Tape Echo", "Plate"], -1.0, -0.1)
+    s.tweak(howl, "Tape Echo", "Echo", {"Time": beats(1.5, tempo), "Feedback": 0.75, "Wow": 0.8, "Mix": 0.4})
+    s.tweak(howl, "Plate", "Plate", {"Decay": 3.5, "Mix": 1.0})
+    let howls = Score()
+    let cry: list[(float, float, int)] = [(0.0, 6.0, 70), (6.0, 2.0, 72), (8.0, 8.0, 75), (16.0, 4.0, 77), (20.0, 4.0, 75), (24.0, 7.0, 72)]
+    howls.phrase(cry, 48, 1, 32.0, 0.6)
+    howls.phrase(cry, 64, 3, 32.0, 0.8, shift = 12)
+    s.write(howl, howls)
+
+    # The coda: the chords slowed to half speed on wobbling tape.
+    let memory = s.part("Memory", "Chord Pad", ["VHS", "Cathedral"], -2.0)
+    s.tweak(memory, "VHS", "Tape", {"Wow": 1.0, "Flutter": 0.5})
+    let memories = Score()
+    for k in 0..<3:
+        let chord = b_chords[k]
+        memories.chord(float((88 + k * 4) * 4), 15.5, [chord[0] - 12, chord[1] - 12, chord[2] - 12, chord[3] - 12], 0.6)
+    s.write(memory, memories)
+    s.master(3.1)
+    return s.song
+
+# ---------------------------------------------------------------- OutRun
+
+## "Neon Boulevard", after Kavinsky's OutRun electro: 118, four on the
+## floor, A minor with the harmonic-minor E. A DX7 bass in octave
+## sixteenths and supersaw chords both pumping hard on every beat, a Juno
+## arp, a hard-synced hook, a gated snare under the clap.
+pub func neon_boulevard() -> Song:
+    let tempo = 118.0
+    let s = Studio("Neon Boulevard", tempo, -1.0)
+    s.section("Intro", 0)
+    s.section("Build", 8)
+    s.section("Drive", 16)
+    s.section("Break", 32)
+    s.section("Drive 2", 40)
+    s.section("Outro", 56)
+    s.section("End", 64)
+    let chords = [[57, 60, 64], [57, 60, 65], [55, 60, 64], [56, 59, 64]]
+    let roots = [33, 29, 36, 28]
+
+    let kit = s.kit("Drums", [("Kick", "Rytm 909 Kick"), ("Hat", "Linn Hat"), ("Open Hat", "Linn Open Hat"), ("Toms", "Linn Tom")], ["Drum Bus", "Heat"], 1.0)
+    s.tweak(kit[0], "Heat", "Drive", {"Drive": 5.0, "Mix": 0.4})
+    let clap = s.part("Clap", "Linn Clap", ["Gated Hall"], 0.0)
+    let snare = s.part("Snare", "Linn Snare", ["Gated Hall"], -4.0)
+    let kicks = Score()
+    let hats = Score()
+    let opens = Score()
+    let claps = Score()
+    let toms = Score()
+    for (first, count) in [(8, 24), (40, 16)]:
+        kicks.steps("X . . . X . . . X . . . X . . .", first, count, 60)
+        hats.steps("x o x o x o x o x o x o x o x o", first + (8 if first == 8 else 0), count - (8 if first == 8 else 0), 60, 0.5, 0.06)
+        opens.steps(". . x . . . x . . . x . . . x .", first + 8 if first == 8 else first, count - 8 if first == 8 else count, 60, 0.5, 0.2, 0.7)
+        claps.steps(". . . . X . . . . . . . X . . .", first, count, 60)
+    kicks.steps("X . . . . . . . . . . . . . . .", 32, 8, 60)
+    for bar in [15, 39]:
+        for (step, pitch) in [(8, 67), (9, 67), (10, 64), (11, 64), (12, 60), (13, 60), (14, 55), (15, 55)]:
+            toms.add(float(bar * 4) + float(step) * 0.25, 0.2, pitch, 0.9)
+    s.write(kit[0], kicks)
+    s.write(kit[1], hats)
+    s.write(kit[2], opens)
+    s.write(kit[3], toms)
+    s.write(clap, claps)
+    s.write(snare, claps)
+
+    let bass = s.part("Bass", "DX Bass", ["Heat", "Pump"], -3.0)
+    s.tweak(bass, "Pump", "Pump", {"Depth": 0.85, "Release": 0.5})
+    let lows = Score()
+    for (first, count) in [(8, 24), (40, 16)]:
+        for bar in 0..<count:
+            let root = roots[(bar // 2) % 4]
+            for k in 0..<16:
+                if k % 4 == 0: continue
+                lows.add(float((first + bar) * 4) + 0.25 * float(k), 0.2, root + (12 if k % 2 == 1 else 0), 0.85 if k % 2 == 1 else 0.6)
+    s.write(bass, lows)
+
+    let saws = s.part("Saws", "Supersaw", ["Juno Chorus", "Hall", "Pump"], -4.0)
+    s.tweak(saws, "Pump", "Pump", {"Depth": 0.7, "Release": 0.6})
+    s.tweak(saws, "Hall", "Hall", {"Decay": 2.5, "Mix": 0.25})
+    let walls = Score()
+    walls.pads(chords, 16, 16, 2, 0.6, 0.05)
+    walls.pads(chords, 32, 8, 2, 0.45, 0.05)
+    walls.pads(chords, 40, 16, 2, 0.65, 0.05)
+    s.write(saws, walls)
+
+    let arp = s.part("Arp", "Juno Arp", ["Juno Chorus", "BBD Echo", "Pump"], -4.0, 0.2)
+    s.tweak(arp, "BBD Echo", "Echo", {"Time": beats(0.75, tempo), "Feedback": 0.35, "Mix": 0.25})
+    let arps = Score()
+    arps.arp(chords, 0, 64, [0, 1, 2, 3, 2, 1], 0.25, 2, 0.55)
+    s.write(arp, arps)
+    s.sweep(arp, "Juno Arp", "Arp Cutoff", [(0.0, 0.0), (64.0, 0.6), (128.0, 0.9), (160.0, 0.3), (224.0, 0.9), (256.0, 0.0)])
+
+    let hook = s.part("Hook", "Sync Lead", ["BBD Echo", "Plate", "Pump"], -2.0)
+    s.tweak(hook, "BBD Echo", "Echo", {"Time": beats(0.75, tempo), "Feedback": 0.3, "Mix": 0.2})
+    s.tweak(hook, "Pump", "Pump", {"Depth": 0.25})
+    let hooks = Score()
+    let line: list[(float, float, int)] = [(0.0, 0.5, 76), (0.5, 0.5, 76), (1.0, 1.0, 74), (2.0, 0.5, 72), (2.5, 1.5, 71),
+                                           (4.0, 1.0, 72), (5.0, 1.0, 74), (6.0, 2.0, 76),
+                                           (8.0, 0.5, 77), (8.5, 0.5, 77), (9.0, 1.0, 76), (10.0, 0.5, 74), (10.5, 1.5, 72), (12.0, 3.5, 71)]
+    hooks.phrase(line, 16, 4, 16.0, 0.85)
+    hooks.phrase(line, 40, 4, 16.0, 0.85)
+    s.write(hook, hooks)
+
+    # The break: the DX piano alone with the chords.
+    let keys = s.part("Keys", "DX Piano", ["Dimension", "Hall"], -2.0)
+    let stabs = Score()
+    stabs.pads(chords, 32, 8, 2, 0.6, 4.0)
+    for bar in 32..<40:
+        let chord = chords[((bar - 32) // 2) % 4]
+        stabs.chord(float(bar * 4) + 2.5, 0.5, chord, 0.45)
+    s.write(keys, stabs)
+    s.master(10.1)
+    return s.song
+
+## Every song to bounce: the demos, then the style studies.
+pub func all_songs() -> list[(str, Song)]:
+    let studies: list[(str, Song)] = [("Cathode Haze", cathode_haze()), ("Coastal Drift", coastal_drift()), ("Night Signal", night_signal()),
+                                           ("Night Interceptor", night_interceptor()), ("Memory Field", memory_field()),
+                                           ("Neon Boulevard", neon_boulevard())]
+    return presets.demo_songs() + studies

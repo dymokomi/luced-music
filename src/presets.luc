@@ -1,0 +1,1254 @@
+## Instruments and effects ready to play, as a synthesizer's factory
+## patches: each a device whose patch is built from the engine's kinds and
+## laid out left to right. And the song a new project starts with.
+from song import Song, Track, Graph, GraphNode, Wire, Lane, Clip, Note, Point
+import catalog
+import rack
+
+## Builds one patch: nodes by kind name with parameters by name, wired by
+## port names.
+class Patcher:
+    let song: Song
+    pub let graph: Graph
+
+    func init(self, song: Song):
+        self.song = song
+        self.graph = Graph()
+
+    func add(self, kind: str, column: float, row: float, settings: map[str, float] = {}) -> GraphNode:
+        let code = catalog.named(kind)
+        let node = GraphNode(self.song.next_id(), code, kind, 30.0 + column * 210.0, 30.0 + row * 120.0)
+        let infos = catalog.params(code)
+        for (name, value) in settings:
+            for at in 0..<infos.length:
+                if infos[at].name == name:
+                    node.params[at] = value
+        self.graph.nodes.append(node)
+        return node
+
+    func wire(self, source: GraphNode, output: str, target: GraphNode, input: str):
+        var out = -1
+        var into = -1
+        let outs = catalog.outputs(source.kind)
+        let ins = catalog.inputs(target.kind)
+        for at in 0..<outs.length:
+            if outs[at].name == output:
+                out = at
+        for at in 0..<ins.length:
+            if ins[at].name == input:
+                into = at
+        if out < 0 or into < 0:
+            trap(f"no port {source.name}.{output} or {target.name}.{input}")
+        self.graph.wires.append(Wire(source = source.id, output = out, target = target.id, input = into))
+
+pub func instrument_names() -> list[str]:
+    return ["Model D", "Moog Bass", "OB Pad", "CS Brass", "Rhodes Suitcase", "MS Acid", "TB Acid",
+            "Juno Stab", "Juno Arp", "Prophet Pluck", "Prophet Strings", "Xpander Pad", "Mini Lead", "Monster Bass", "Octave Bass",
+            "Sync Lead", "Truise Lead", "Pedal Bass", "Mother Arp", "DX Piano", "DX Bass", "DX Brass", "DX Bells", "DX Glass", "Drone", "Howl Lead", "Rival Pulse", "Chord Pad", "Stacked Mono", "Supersaw",
+            "Linn Kick", "Linn Snare", "Linn Tom", "Linn Hat", "Linn Open Hat", "Linn Clap", "Linn Rim", "Tambourine", "Shaker", "Linn Cowbell",
+            "Rytm Kick", "Rytm 909 Kick", "Rytm Snare", "Rytm Hat", "Rytm Open Hat", "Rytm Clap", "Rytm Tom", "Rytm Cowbell",
+            "Analog Lead", "Soft Pad", "Sub Bass", "Pluck", "FM Bell", "Kick", "Hat", "Init Synth"]
+
+pub func effect_names() -> list[str]:
+    return ["Plate", "Blade Runner Hall", "Tape Echo", "BBD Echo", "Juno Chorus", "Ensemble", "Dimension", "Suitcase Tremolo", "BOUM", "Heat",
+            "Phaser", "Flanger", "Lo-Fi", "Tape Deck", "Cassette", "VHS", "Pump", "Hall", "Gated Hall", "Wide",
+            "EQ", "Low Cut", "Glue", "Drum Bus", "Cathedral", "Freq Shift",
+            "SSL Bus", "FET Smash", "Opto Leveler", "Vari-Mu", "Limiter", "Master",
+            "Delay", "Reverb", "Drive", "Filter", "Utility"]
+
+## A device playing the preset `name`, at (x, y) in its rack.
+pub func make(song: Song, name: str, x: float, y: float) -> GraphNode:
+    let p = Patcher(song)
+    var voices = 8
+    let (analog, analog_voices) = build_analog(p, name)
+    let (retro, retro_voices) = build_retro(p, name) if not analog else (false, 0)
+    if analog:
+        voices = analog_voices
+    elif retro:
+        voices = retro_voices
+    elif name == "Analog Lead":
+        build_lead(p)
+    elif name == "Soft Pad":
+        build_pad(p)
+    elif name == "Sub Bass":
+        build_bass(p)
+        voices = 1
+    elif name == "Pluck":
+        build_pluck(p)
+    elif name == "FM Bell":
+        build_bell(p)
+    elif name == "Kick":
+        build_kick(p)
+        voices = 2
+    elif name == "Hat":
+        build_hat(p)
+        voices = 4
+    elif name == "Delay":
+        build_delay(p)
+        voices = 1
+    elif name == "Reverb":
+        build_reverb(p)
+        voices = 1
+    elif name == "Drive":
+        build_drive(p)
+        voices = 1
+    elif name == "Filter":
+        build_filter(p)
+        voices = 1
+    elif name == "Utility":
+        build_utility(p)
+        voices = 1
+    else:
+        build_init(p)
+    let device = GraphNode(song.next_id(), catalog.device_kind, name, x, y)
+    device.patch = p.graph
+    device.voices = voices
+    return device
+
+func build_init(p: Patcher):
+    let note = p.add("Note In", 0.0, 0.0)
+    let tone = p.add("Oscillator", 1.0, 0.0)
+    let shape = p.add("Envelope", 1.0, 1.0)
+    let amp = p.add("Multiply", 2.0, 0.0)
+    let out = p.add("Output", 3.0, 0.0)
+    p.wire(note, "pitch", tone, "pitch")
+    p.wire(note, "gate", shape, "gate")
+    p.wire(tone, "out", amp, "a")
+    p.wire(shape, "out", amp, "b")
+    p.wire(amp, "out", out, "left")
+
+func build_lead(p: Patcher):
+    let note = p.add("Note In", 0.0, 0.0)
+    let saw = p.add("Oscillator", 1.0, 0.0, {"Wave": 2.0, "Level": 0.45})
+    let detuned = p.add("Oscillator", 1.0, 1.0, {"Wave": 2.0, "Fine": 7.0, "Level": 0.35})
+    let blend = p.add("Mix", 2.0, 0.0)
+    let filter_shape = p.add("Envelope", 1.0, 2.0, {"Attack": 0.003, "Decay": 0.25, "Sustain": 0.15, "Release": 0.3})
+    let control = p.add("Control In", 1.0, 3.0)
+    let amount = p.add("Mix", 2.0, 2.0, {"Gain A": 3.0, "Gain B": 3.0})
+    let filter = p.add("Filter", 3.0, 0.0, {"Cutoff": 500.0, "Resonance": 0.35})
+    let amp_shape = p.add("Envelope", 3.0, 1.0, {"Attack": 0.004, "Decay": 0.2, "Sustain": 0.65, "Release": 0.25})
+    let amp = p.add("Multiply", 4.0, 0.0)
+    let soft = p.add("Multiply", 5.0, 0.0)
+    let out = p.add("Output", 6.0, 0.0)
+    p.wire(note, "pitch", saw, "pitch")
+    p.wire(note, "pitch", detuned, "pitch")
+    p.wire(saw, "out", blend, "a")
+    p.wire(detuned, "out", blend, "b")
+    p.wire(note, "gate", filter_shape, "gate")
+    p.wire(filter_shape, "out", amount, "a")
+    p.wire(control, "value", amount, "b")
+    p.wire(blend, "out", filter, "in")
+    p.wire(amount, "out", filter, "cutoff")
+    p.wire(note, "gate", amp_shape, "gate")
+    p.wire(filter, "out", amp, "a")
+    p.wire(amp_shape, "out", amp, "b")
+    p.wire(amp, "out", soft, "a")
+    p.wire(note, "velocity", soft, "b")
+    p.wire(soft, "out", out, "left")
+
+func build_pad(p: Patcher):
+    let note = p.add("Note In", 0.0, 0.0)
+    let low = p.add("Oscillator", 1.0, 0.0, {"Wave": 2.0, "Fine": -8.0, "Level": 0.3})
+    let high = p.add("Oscillator", 1.0, 1.0, {"Wave": 2.0, "Fine": 8.0, "Level": 0.3})
+    let blend = p.add("Mix", 2.0, 0.0)
+    let wobble = p.add("LFO", 2.0, 1.5, {"Rate": 0.3, "Depth": 0.6})
+    let filter = p.add("Filter", 3.0, 0.0, {"Cutoff": 900.0, "Resonance": 0.1})
+    let shape = p.add("Envelope", 3.0, 1.0, {"Attack": 0.6, "Decay": 1.0, "Sustain": 0.8, "Release": 1.5})
+    let amp = p.add("Multiply", 4.0, 0.0)
+    let out = p.add("Output", 5.0, 0.0)
+    p.wire(note, "pitch", low, "pitch")
+    p.wire(note, "pitch", high, "pitch")
+    p.wire(low, "out", blend, "a")
+    p.wire(high, "out", blend, "b")
+    p.wire(blend, "out", filter, "in")
+    p.wire(wobble, "out", filter, "cutoff")
+    p.wire(note, "gate", shape, "gate")
+    p.wire(filter, "out", amp, "a")
+    p.wire(shape, "out", amp, "b")
+    p.wire(amp, "out", out, "left")
+
+func build_bass(p: Patcher):
+    let note = p.add("Note In", 0.0, 0.0)
+    let glide = p.add("Glide", 1.0, 0.0, {"Time": 0.04})
+    let square = p.add("Oscillator", 2.0, 0.0, {"Wave": 3.0, "Level": 0.2})
+    let sine = p.add("Oscillator", 2.0, 1.0, {"Wave": 0.0, "Level": 0.4})
+    let blend = p.add("Mix", 3.0, 0.0)
+    let filter = p.add("Filter", 4.0, 0.0, {"Cutoff": 420.0, "Resonance": 0.25})
+    let shape = p.add("Envelope", 4.0, 1.0, {"Attack": 0.002, "Decay": 0.3, "Sustain": 0.8, "Release": 0.08})
+    let amp = p.add("Multiply", 5.0, 0.0)
+    let out = p.add("Output", 6.0, 0.0)
+    p.wire(note, "pitch", glide, "in")
+    p.wire(glide, "out", square, "pitch")
+    p.wire(glide, "out", sine, "pitch")
+    p.wire(square, "out", blend, "a")
+    p.wire(sine, "out", blend, "b")
+    p.wire(blend, "out", filter, "in")
+    p.wire(note, "gate", shape, "gate")
+    p.wire(filter, "out", amp, "a")
+    p.wire(shape, "out", amp, "b")
+    p.wire(amp, "out", out, "left")
+
+func build_pluck(p: Patcher):
+    let note = p.add("Note In", 0.0, 0.0)
+    let saw = p.add("Oscillator", 1.0, 0.0, {"Wave": 2.0, "Level": 0.5})
+    let filter_shape = p.add("Envelope", 1.0, 1.0, {"Attack": 0.001, "Decay": 0.15, "Sustain": 0.0, "Release": 0.15})
+    let amount = p.add("Mix", 2.0, 1.0, {"Gain A": 4.0})
+    let filter = p.add("Filter", 3.0, 0.0, {"Cutoff": 300.0, "Resonance": 0.2})
+    let shape = p.add("Envelope", 3.0, 1.0, {"Attack": 0.001, "Decay": 0.5, "Sustain": 0.0, "Release": 0.3})
+    let amp = p.add("Multiply", 4.0, 0.0)
+    let out = p.add("Output", 5.0, 0.0)
+    p.wire(note, "pitch", saw, "pitch")
+    p.wire(note, "gate", filter_shape, "gate")
+    p.wire(filter_shape, "out", amount, "a")
+    p.wire(saw, "out", filter, "in")
+    p.wire(amount, "out", filter, "cutoff")
+    p.wire(note, "gate", shape, "gate")
+    p.wire(filter, "out", amp, "a")
+    p.wire(shape, "out", amp, "b")
+    p.wire(amp, "out", out, "left")
+
+func build_bell(p: Patcher):
+    let note = p.add("Note In", 0.0, 0.0)
+    let modulator = p.add("Oscillator", 1.0, 1.0, {"Wave": 0.0, "Octave": 1.0, "Semitones": 7.0, "Level": 0.6})
+    let index = p.add("Envelope", 1.0, 2.0, {"Attack": 0.001, "Decay": 1.2, "Sustain": 0.0, "Release": 0.8})
+    let depth = p.add("Multiply", 2.0, 1.0)
+    let carrier = p.add("Oscillator", 3.0, 0.0, {"Wave": 0.0, "Level": 0.5})
+    let shape = p.add("Envelope", 3.0, 1.0, {"Attack": 0.001, "Decay": 2.0, "Sustain": 0.0, "Release": 1.2})
+    let amp = p.add("Multiply", 4.0, 0.0)
+    let out = p.add("Output", 5.0, 0.0)
+    p.wire(note, "pitch", modulator, "pitch")
+    p.wire(note, "pitch", carrier, "pitch")
+    p.wire(note, "gate", index, "gate")
+    p.wire(modulator, "out", depth, "a")
+    p.wire(index, "out", depth, "b")
+    p.wire(depth, "out", carrier, "phase")
+    p.wire(note, "gate", shape, "gate")
+    p.wire(carrier, "out", amp, "a")
+    p.wire(shape, "out", amp, "b")
+    p.wire(amp, "out", out, "left")
+
+func build_kick(p: Patcher):
+    let note = p.add("Note In", 0.0, 0.0)
+    let sweep = p.add("Envelope", 1.0, 0.0, {"Attack": 0.0005, "Decay": 0.06, "Sustain": 0.0, "Release": 0.05})
+    let amount = p.add("Mix", 2.0, 0.0, {"Gain A": 2.5})
+    let body = p.add("Oscillator", 3.0, 0.0, {"Wave": 0.0, "Octave": -2.0, "Level": 0.9})
+    let shape = p.add("Envelope", 3.0, 1.0, {"Attack": 0.0005, "Decay": 0.35, "Sustain": 0.0, "Release": 0.1})
+    let amp = p.add("Multiply", 4.0, 0.0)
+    let punch = p.add("Drive", 5.0, 0.0, {"Drive": 6.0, "Mix": 0.6})
+    let out = p.add("Output", 6.0, 0.0)
+    p.wire(note, "gate", sweep, "gate")
+    p.wire(sweep, "out", amount, "a")
+    p.wire(amount, "out", body, "pitch")
+    p.wire(note, "gate", shape, "gate")
+    p.wire(body, "out", amp, "a")
+    p.wire(shape, "out", amp, "b")
+    p.wire(amp, "out", punch, "in")
+    p.wire(punch, "out", out, "left")
+
+func build_hat(p: Patcher):
+    let note = p.add("Note In", 0.0, 0.0)
+    let hiss = p.add("Noise", 1.0, 0.0, {"Level": 0.5})
+    let filter = p.add("Filter", 2.0, 0.0, {"Mode": 2.0, "Cutoff": 7000.0, "Resonance": 0.2})
+    let shape = p.add("Envelope", 2.0, 1.0, {"Attack": 0.0005, "Decay": 0.05, "Sustain": 0.0, "Release": 0.04})
+    let amp = p.add("Multiply", 3.0, 0.0)
+    let soft = p.add("Multiply", 4.0, 0.0)
+    let out = p.add("Output", 5.0, 0.0, {"Gain": -6.0})
+    p.wire(hiss, "out", filter, "in")
+    p.wire(note, "gate", shape, "gate")
+    p.wire(filter, "out", amp, "a")
+    p.wire(shape, "out", amp, "b")
+    p.wire(amp, "out", soft, "a")
+    p.wire(note, "velocity", soft, "b")
+    p.wire(soft, "out", out, "left")
+
+func build_delay(p: Patcher):
+    let input = p.add("Audio In", 0.0, 0.0)
+    let left = p.add("Simple Delay", 1.0, 0.0, {"Time": 375.0, "Feedback": 0.35, "Mix": 0.3})
+    let right = p.add("Simple Delay", 1.0, 1.0, {"Time": 500.0, "Feedback": 0.3, "Mix": 0.3})
+    let out = p.add("Output", 2.0, 0.0)
+    p.wire(input, "left", left, "in")
+    p.wire(input, "right", right, "in")
+    p.wire(left, "out", out, "left")
+    p.wire(right, "out", out, "right")
+
+func build_reverb(p: Patcher):
+    let input = p.add("Audio In", 0.0, 0.0)
+    let room = p.add("Room", 1.0, 0.0)
+    let out = p.add("Output", 2.0, 0.0)
+    p.wire(input, "left", room, "left")
+    p.wire(input, "right", room, "right")
+    p.wire(room, "left", out, "left")
+    p.wire(room, "right", out, "right")
+
+func build_drive(p: Patcher):
+    let input = p.add("Audio In", 0.0, 0.0)
+    let left = p.add("Drive", 1.0, 0.0)
+    let right = p.add("Drive", 1.0, 1.0)
+    let out = p.add("Output", 2.0, 0.0, {"Gain": -3.0})
+    p.wire(input, "left", left, "in")
+    p.wire(input, "right", right, "in")
+    p.wire(left, "out", out, "left")
+    p.wire(right, "out", out, "right")
+
+func build_filter(p: Patcher):
+    let input = p.add("Audio In", 0.0, 0.0)
+    let control = p.add("Control In", 0.0, 1.5)
+    let amount = p.add("Mix", 1.0, 1.5, {"Gain A": 4.0})
+    let left = p.add("Filter", 2.0, 0.0, {"Cutoff": 400.0})
+    let right = p.add("Filter", 2.0, 1.0, {"Cutoff": 400.0})
+    let out = p.add("Output", 3.0, 0.0)
+    p.wire(control, "value", amount, "a")
+    p.wire(input, "left", left, "in")
+    p.wire(input, "right", right, "in")
+    p.wire(amount, "out", left, "cutoff")
+    p.wire(amount, "out", right, "cutoff")
+    p.wire(left, "out", out, "left")
+    p.wire(right, "out", out, "right")
+
+func build_utility(p: Patcher):
+    let input = p.add("Audio In", 0.0, 0.0)
+    let left = p.add("Gain", 1.0, 0.0)
+    let right = p.add("Gain", 1.0, 1.0)
+    let out = p.add("Output", 2.0, 0.0)
+    p.wire(input, "left", left, "in")
+    p.wire(input, "right", right, "in")
+    p.wire(left, "out", out, "left")
+    p.wire(right, "out", out, "right")
+
+## Wire `source`'s output `output` into `target`'s input `input` in `track`'s rack.
+pub func patch_rack(track: Track, source: GraphNode, output: int, target: GraphNode, input: int):
+    _ = track.rack.connect(Wire(source = source.id, output = output, target = target.id, input = input), sums = rack.sums(target, input))
+
+## A device of preset `name` on `track`, played by `lane` when given, and
+## feeding the track's output.
+pub func add_device(song: Song, track: Track, name: str, lane: Lane?, row: int) -> GraphNode:
+    let device = make(song, name, 260.0, 30.0 + 110.0 * float(row))
+    track.rack.nodes.append(device)
+    if let source = lane:
+        if let node = song.lane_node(track, source.id):
+            patch_rack(track, node, 0, device, catalog.device_notes)
+    if let out = song.output_of(track):
+        patch_rack(track, device, 0, out, catalog.output_audio)
+    return device
+
+func notes_clip(song: Song, lane: Lane, name: str, start: float, length: float, notes: list[(float, float, int)]) -> Clip:
+    let clip = Clip(song.next_id(), name, start, length)
+    for (beat, duration, pitch) in notes:
+        clip.notes.append(Note(start = beat, length = duration, pitch = pitch, velocity = 0.8))
+    lane.clips.append(clip)
+    return clip
+
+## The song a new project opens with: four bars in A minor (Am F C G) on
+## a lead through a delay, a bass, a pad through a reverb and drums.
+pub func demo_song() -> Song:
+    let song = Song()
+    song.name = "Untitled"
+    song.loop_on = true
+    song.loop_end = 16.0
+    song.master = -3.0
+    let chords = [[57, 60, 64], [53, 57, 60], [55, 60, 64], [55, 59, 62]]
+    let roots = [33, 29, 36, 31]
+
+    let lead = song.add_track("Lead")
+    let melody = song.add_lane(lead, "Melody", false)
+    let cutoff = song.add_lane(lead, "Cutoff", true)
+    let synth = add_device(song, lead, "Analog Lead", melody, 0)
+    let echo = make(song, "Delay", 500.0, 30.0)
+    lead.rack.nodes.append(echo)
+    lead.rack.wires = lead.rack.wires.filter((w) => w.source != synth.id)
+    patch_rack(lead, synth, 0, echo, catalog.device_audio)
+    if let out = song.output_of(lead):
+        patch_rack(lead, echo, 0, out, catalog.output_audio)
+        out.x = 740.0
+    if let node = song.lane_node(lead, cutoff.id):
+        patch_rack(lead, node, 0, synth, catalog.device_control)
+    let arpeggio: list[(float, float, int)] = []
+    for bar in 0..<4:
+        let chord = chords[bar]
+        let order = [chord[0] + 12, chord[1] + 12, chord[2] + 12, chord[1] + 12]
+        for step in 0..<8:
+            arpeggio.append((float(bar * 4) + float(step) * 0.5, 0.45, order[step % 4]))
+    _ = notes_clip(song, melody, "Arpeggio", 0.0, 16.0, arpeggio)
+    let sweep = Clip(song.next_id(), "Sweep", 0.0, 16.0)
+    sweep.points = [Point(beat = 0.0, value = 0.1, shape = 0), Point(beat = 8.0, value = 0.8, shape = 0), Point(beat = 16.0, value = 0.1, shape = 0)]
+    cutoff.clips.append(sweep)
+
+    let bass = song.add_track("Bass")
+    bass.volume = -9.0
+    let line = song.add_lane(bass, "Bass", false)
+    _ = add_device(song, bass, "Sub Bass", line, 0)
+    let bass_notes: list[(float, float, int)] = []
+    for bar in 0..<4:
+        for step in 0..<4:
+            bass_notes.append((float(bar * 4 + step), 0.8 if step % 2 == 0 else 0.4, roots[bar] + (12 if step == 3 else 0)))
+    _ = notes_clip(song, line, "Roots", 0.0, 16.0, bass_notes)
+
+    let pad = song.add_track("Pad")
+    let harmony = song.add_lane(pad, "Chords", false)
+    let strings = add_device(song, pad, "Soft Pad", harmony, 0)
+    let room = make(song, "Reverb", 500.0, 30.0)
+    pad.rack.nodes.append(room)
+    pad.rack.wires = pad.rack.wires.filter((w) => w.source != strings.id)
+    patch_rack(pad, strings, 0, room, catalog.device_audio)
+    if let out = song.output_of(pad):
+        patch_rack(pad, room, 0, out, catalog.output_audio)
+        out.x = 740.0
+    pad.volume = -6.0
+    let chord_notes: list[(float, float, int)] = []
+    for bar in 0..<4:
+        for pitch in chords[bar]:
+            chord_notes.append((float(bar * 4), 3.9, pitch))
+    _ = notes_clip(song, harmony, "Chords", 0.0, 16.0, chord_notes)
+
+    let drums = song.add_track("Drums")
+    let kicks = song.add_lane(drums, "Kick", false)
+    let hats = song.add_lane(drums, "Hat", false)
+    _ = add_device(song, drums, "Kick", kicks, 0)
+    _ = add_device(song, drums, "Hat", hats, 1)
+    let kick_notes: list[(float, float, int)] = []
+    let hat_notes: list[(float, float, int)] = []
+    for beat in 0..<4:
+        kick_notes.append((float(beat), 0.25, 36))
+        hat_notes.append((float(beat) + 0.5, 0.1, 42))
+    let kick_clip = notes_clip(song, kicks, "Four", 0.0, 16.0, kick_notes)
+    kick_clip.loop = 4.0
+    let hat_clip = notes_clip(song, hats, "Offbeats", 0.0, 16.0, hat_notes)
+    hat_clip.loop = 4.0
+    return song
+
+## A 303 line over a 909 kick and hats, the line through a tape echo and a
+## phaser.
+pub func acid_song() -> Song:
+    let song = Song()
+    song.name = "Acid"
+    song.tempo = 128.0
+    song.loop_on = true
+    song.loop_end = 16.0
+    let drums = song.add_track("Drums")
+    drums.volume = -2.0
+    let kick = drum_lane(song, drums, "Kick", "Rytm 909 Kick", 0)
+    let hat = drum_lane(song, drums, "Hat", "Rytm Hat", 1)
+    let clap = drum_lane(song, drums, "Clap", "Rytm Clap", 2)
+    let kicks: list[(float, float, int, float)] = []
+    let hats: list[(float, float, int, float)] = []
+    let claps: list[(float, float, int, float)] = []
+    for beat in 0..<16:
+        kicks.append((float(beat), 0.2, 36, 0.95))
+        hats.append((float(beat) + 0.5, 0.1, 42, 0.8))
+        hats.append((float(beat) + 0.75, 0.1, 42, 0.35))
+        if beat % 4 == 2:
+            claps.append((float(beat), 0.2, 39, 0.7))
+    _ = clip_of(song, kick, "Four", 16.0, kicks)
+    _ = clip_of(song, hat, "Off", 16.0, hats)
+    _ = clip_of(song, clap, "Three", 16.0, claps)
+    let acid = instrument_track(song, "303", "TB Acid", ["Phaser", "Tape Echo"], 2.0)
+    let line = [33, 33, 45, 33, 36, 33, 43, 45, 33, 33, 40, 33, 31, 33, 45, 38]
+    let accents = [1.0, 0.3, 0.9, 0.3, 0.5, 0.3, 1.0, 0.5, 0.3, 0.3, 0.9, 0.3, 0.6, 0.3, 1.0, 0.5]
+    let notes: list[(float, float, int, float)] = []
+    for bar in 0..<4:
+        for step in 0..<16:
+            notes.append((float(bar * 4) + 0.25 * float(step), 0.22 if step % 3 != 2 else 0.3, line[step], accents[step]))
+    _ = clip_of(song, acid, "Line", 16.0, notes)
+    return song
+
+## A preset heard alone: a drum struck four times, an instrument playing a
+## chord then a phrase, an effect fed a pluck.
+pub func audition(name: str) -> Song:
+    let song = Song()
+    song.name = name
+    song.tempo = 120.0
+    let notes: list[(float, float, int, float)] = []
+    if name in effect_names():
+        let lane = instrument_track(song, "Pluck", "Prophet Pluck", [name])
+        for (beat, pitch) in [(0.0, 57), (0.5, 64), (1.0, 69), (2.0, 60), (3.0, 52)]:
+            notes.append((beat, 0.3, pitch, 0.8))
+        _ = clip_of(song, lane, "Pluck", 8.0, notes)
+        return song
+    let lane = instrument_track(song, name, name, [])
+    if name.starts_with("Linn") or name in ["Tambourine", "Shaker"] or name.starts_with("Rytm") or name in ["Kick", "Hat"]:
+        for k in 0..<4:
+            notes.append((float(k), 0.2, 60, 0.4 + 0.2 * float(k)))
+        _ = clip_of(song, lane, "Hits", 4.0, notes)
+        return song
+    for pitch in [48, 55, 60, 64]:
+        notes.append((0.0, 3.0, pitch, 0.7))
+    var beat = 4.0
+    for pitch in [57, 60, 64, 67, 72, 67, 64, 45]:
+        notes.append((beat, 0.45, pitch, 0.5 + 0.06 * (beat - 4.0)))
+        beat += 0.5
+    notes.append((beat, 2.0, 33, 0.9))
+    _ = clip_of(song, lane, "Phrase", 12.0, notes)
+    return song
+
+## Every demo song, by name, for bouncing and the File menu.
+pub func demo_songs() -> list[(str, Song)]:
+    return [("Demo", demo_song()), ("Blade Runner", blade_runner_song()), ("Elektron", elektron_song()), ("Acid", acid_song())]
+
+# ---------------------------------------------------------------- the analog instruments
+
+## A contour: an Analog Envelope on the note's gate (and velocity).
+func contour(p: Patcher, note: GraphNode, column: float, row: float, settings: map[str, float]) -> GraphNode:
+    let shape = p.add("Analog Envelope", column, row, settings)
+    p.wire(note, "gate", shape, "gate")
+    p.wire(note, "velocity", shape, "velocity")
+    return shape
+
+## The Minimoog Model D: three VCOs (two saws a few cents apart, a square an
+## octave down) into a mixer driven a little hot (the Model D's overload),
+## the 24 dB ladder opened by its own contour, then an OTA VCA on the
+## loudness contour. Control In 1 moves the cutoff.
+func build_model_d(p: Patcher):
+    let note = p.add("Note In", 0.0, 0.0)
+    let one = p.add("Analog VCO", 1.0, 0.0, {"Shape": 0.5, "Level": 0.4, "Drift": 3.0})
+    let two = p.add("Analog VCO", 1.0, 1.0, {"Shape": 0.5, "Fine": 6.0, "Level": 0.35, "Drift": 4.0})
+    let three = p.add("Analog VCO", 1.0, 2.0, {"Shape": 1.0, "Octave": -1.0, "Level": 0.3, "Drift": 3.0})
+    let mixer = p.add("Mix", 2.0, 0.0)
+    let hot = p.add("Drive", 3.0, 0.0, {"Circuit": 0.0, "Drive": 6.0, "Output": -3.0, "High Cut": 18000.0})
+    let filter_contour = contour(p, note, 2.0, 2.0, {"Attack": 0.004, "Decay": 0.35, "Sustain": 0.25, "Release": 0.3, "Velocity": 0.4})
+    let control = p.add("Control In", 2.0, 3.0)
+    let amount = p.add("Mix", 3.0, 2.0, {"Gain A": 3.5, "Gain B": 3.0})
+    let ladder = p.add("Ladder", 4.0, 0.0, {"Cutoff": 350.0, "Resonance": 0.45, "Drive": 4.0, "Slop": 0.4})
+    let loudness = contour(p, note, 4.0, 2.0, {"Attack": 0.003, "Decay": 0.25, "Sustain": 0.75, "Release": 0.2, "Velocity": 0.6})
+    let vca = p.add("OTA VCA", 5.0, 0.0, {"Drive": 2.0})
+    let out = p.add("Output", 6.0, 0.0, {"Gain": -3.0})
+    p.wire(note, "pitch", one, "pitch")
+    p.wire(note, "pitch", two, "pitch")
+    p.wire(note, "pitch", three, "pitch")
+    p.wire(one, "out", mixer, "a")
+    p.wire(two, "out", mixer, "b")
+    p.wire(three, "out", mixer, "c")
+    p.wire(mixer, "out", hot, "in")
+    p.wire(filter_contour, "out", amount, "a")
+    p.wire(control, "value", amount, "b")
+    p.wire(hot, "out", ladder, "in")
+    p.wire(amount, "out", ladder, "cutoff")
+    p.wire(ladder, "out", vca, "in")
+    p.wire(loudness, "out", vca, "cv")
+    p.wire(vca, "out", out, "left")
+
+## The Model D's bass: one saw and a square an octave down, the ladder
+## nearly closed and snapping open, a short punchy contour, one voice.
+func build_moog_bass(p: Patcher):
+    let note = p.add("Note In", 0.0, 0.0)
+    let glide = p.add("Glide", 1.0, 0.0, {"Time": 0.02})
+    let saw = p.add("Analog VCO", 2.0, 0.0, {"Shape": 0.5, "Level": 0.45, "Drift": 2.0})
+    let square = p.add("Analog VCO", 2.0, 1.0, {"Shape": 1.0, "Octave": -1.0, "Level": 0.35, "Drift": 2.0})
+    let mixer = p.add("Mix", 3.0, 0.0)
+    let filter_contour = contour(p, note, 3.0, 2.0, {"Attack": 0.002, "Decay": 0.18, "Sustain": 0.1, "Release": 0.12, "Velocity": 0.6})
+    let amount = p.add("Mix", 4.0, 2.0, {"Gain A": 4.0})
+    let ladder = p.add("Ladder", 5.0, 0.0, {"Cutoff": 140.0, "Resonance": 0.35, "Drive": 6.0, "Bass": 0.5})
+    let loudness = contour(p, note, 5.0, 2.0, {"Attack": 0.002, "Decay": 0.3, "Sustain": 0.8, "Release": 0.08})
+    let vca = p.add("OTA VCA", 6.0, 0.0)
+    let out = p.add("Output", 7.0, 0.0, {"Gain": -2.0})
+    p.wire(note, "pitch", glide, "in")
+    p.wire(glide, "out", saw, "pitch")
+    p.wire(glide, "out", square, "pitch")
+    p.wire(saw, "out", mixer, "a")
+    p.wire(square, "out", mixer, "b")
+    p.wire(filter_contour, "out", amount, "a")
+    p.wire(mixer, "out", ladder, "in")
+    p.wire(amount, "out", ladder, "cutoff")
+    p.wire(ladder, "out", vca, "in")
+    p.wire(loudness, "out", vca, "cv")
+    p.wire(vca, "out", out, "left")
+
+## An OB-6 pad: a saw and a pulse slowly beating, the SEM filter leaning
+## toward its notch, slow contours; a gentle LFO breathes the cutoff.
+func build_ob_pad(p: Patcher):
+    let note = p.add("Note In", 0.0, 0.0)
+    let saw = p.add("Analog VCO", 1.0, 0.0, {"Shape": 0.5, "Fine": -7.0, "Level": 0.35, "Drift": 5.0})
+    let pulse = p.add("Analog VCO", 1.0, 1.0, {"Shape": 0.85, "Pulse Width": 0.35, "Fine": 7.0, "Level": 0.3, "Drift": 5.0})
+    let mixer = p.add("Mix", 2.0, 0.0)
+    let wobble = p.add("LFO", 2.0, 2.0, {"Rate": 0.25, "Depth": 0.5})
+    let filter_contour = contour(p, note, 2.0, 3.0, {"Attack": 0.8, "Decay": 1.5, "Sustain": 0.6, "Release": 1.5})
+    let amount = p.add("Mix", 3.0, 2.0, {"Gain A": 1.0, "Gain B": 1.5})
+    let sem = p.add("SEM", 4.0, 0.0, {"Cutoff": 700.0, "Resonance": 0.35, "Mode": 0.25})
+    let loudness = contour(p, note, 4.0, 2.0, {"Attack": 0.6, "Decay": 1.0, "Sustain": 0.85, "Release": 1.8})
+    let vca = p.add("OTA VCA", 5.0, 0.0)
+    let out = p.add("Output", 6.0, 0.0, {"Gain": -4.0})
+    p.wire(note, "pitch", saw, "pitch")
+    p.wire(note, "pitch", pulse, "pitch")
+    p.wire(saw, "out", mixer, "a")
+    p.wire(pulse, "out", mixer, "b")
+    p.wire(wobble, "out", amount, "a")
+    p.wire(filter_contour, "out", amount, "b")
+    p.wire(mixer, "out", sem, "in")
+    p.wire(amount, "out", sem, "cutoff")
+    p.wire(sem, "out", vca, "in")
+    p.wire(loudness, "out", vca, "cv")
+    p.wire(vca, "out", out, "left")
+
+## One CS-80 layer: a saw (and a sine beside it) through the high pass into
+## the low pass, the filter swelling open on a slow contour.
+func cs_layer(p: Patcher, note: GraphNode, row: float, fine: float, filter_contour: GraphNode) -> GraphNode:
+    let saw = p.add("Analog VCO", 1.0, row, {"Shape": 0.5, "Fine": fine, "Level": 0.45, "Drift": 6.0})
+    let filter = p.add("CS Filter", 3.0, row, {"High Cutoff": 90.0, "High Resonance": 0.1, "Low Cutoff": 450.0, "Low Resonance": 0.35})
+    p.wire(note, "pitch", saw, "pitch")
+    p.wire(saw, "out", filter, "in")
+    p.wire(filter_contour, "out", filter, "low")
+    return filter
+
+## The Yamaha CS-80 brass of Blade Runner: two layers detuned against each
+## other, each its own HP → LP filter opening slowly (the swell), a sine
+## for body, a long release; play it into the Blade Runner Hall.
+func build_cs_brass(p: Patcher):
+    let note = p.add("Note In", 0.0, 0.0)
+    let swell = contour(p, note, 0.0, 2.0, {"Attack": 0.45, "Decay": 1.2, "Sustain": 0.55, "Release": 1.4, "Velocity": 0.7})
+    let depth = p.add("Mix", 2.0, 2.0, {"Gain A": 2.6})
+    let layer_one = cs_layer(p, note, 0.0, -9.0, depth)
+    let layer_two = cs_layer(p, note, 1.0, 9.0, depth)
+    let sine = p.add("Analog VCO", 1.0, 3.0, {"Shape": 0.0, "Level": 0.15, "Drift": 6.0})
+    let mixer = p.add("Mix", 4.0, 0.0)
+    let loudness = contour(p, note, 4.0, 2.0, {"Attack": 0.25, "Decay": 1.0, "Sustain": 0.8, "Release": 1.6, "Velocity": 0.5})
+    let vca = p.add("OTA VCA", 5.0, 0.0)
+    let out = p.add("Output", 6.0, 0.0, {"Gain": -5.0})
+    p.wire(swell, "out", depth, "a")
+    p.wire(note, "pitch", sine, "pitch")
+    p.wire(layer_one, "out", mixer, "a")
+    p.wire(layer_two, "out", mixer, "b")
+    p.wire(sine, "out", mixer, "c")
+    p.wire(mixer, "out", vca, "in")
+    p.wire(loudness, "out", vca, "cv")
+    p.wire(vca, "out", out, "left")
+
+## A Rhodes Mark I Suitcase: the tine piano through its stereo vibrato.
+func build_suitcase(p: Patcher):
+    let note = p.add("Note In", 0.0, 0.0)
+    let piano = p.add("Tine Piano", 1.0, 0.0, {"Bell": 0.45, "Symmetry": 0.3, "Reach": 1.1, "Tone": 4500.0, "Drive": 3.0})
+    let vibrato = p.add("Tremolo", 2.0, 0.0, {"Rate": 4.2, "Depth": 0.35, "Shape": 0.1})
+    let out = p.add("Output", 3.0, 0.0, {"Gain": 0.0})
+    p.wire(note, "pitch", piano, "pitch")
+    p.wire(note, "gate", piano, "gate")
+    p.wire(note, "velocity", piano, "velocity")
+    p.wire(piano, "out", vibrato, "left")
+    p.wire(vibrato, "left", out, "left")
+    p.wire(vibrato, "right", out, "right")
+
+## The MS-20 acid line: a saw into the Korg35 with the low peak high, a fast
+## contour snapping the cutoff; accented notes (velocity) bite harder.
+func build_ms_acid(p: Patcher):
+    let note = p.add("Note In", 0.0, 0.0)
+    let saw = p.add("Analog VCO", 1.0, 0.0, {"Shape": 0.55, "Level": 0.5, "Drift": 2.0})
+    let snap = contour(p, note, 1.0, 2.0, {"Attack": 0.001, "Decay": 0.16, "Sustain": 0.0, "Release": 0.1, "Velocity": 0.8})
+    let amount = p.add("Mix", 2.0, 2.0, {"Gain A": 3.8})
+    let ms = p.add("MS-20", 3.0, 0.0, {"High Cutoff": 40.0, "Low Cutoff": 260.0, "Low Peak": 0.82, "Drive": 6.0, "Flavor": 0.0})
+    let loudness = contour(p, note, 3.0, 2.0, {"Attack": 0.002, "Decay": 0.2, "Sustain": 0.7, "Release": 0.06})
+    let vca = p.add("OTA VCA", 4.0, 0.0)
+    let out = p.add("Output", 5.0, 0.0, {"Gain": -5.0})
+    p.wire(note, "pitch", saw, "pitch")
+    p.wire(snap, "out", amount, "a")
+    p.wire(saw, "out", ms, "in")
+    p.wire(amount, "out", ms, "cutoff")
+    p.wire(ms, "out", vca, "in")
+    p.wire(loudness, "out", vca, "cv")
+    p.wire(vca, "out", out, "left")
+
+## The TB-303: a saw (or square) into the diode ladder, a fast decaying
+## contour on the cutoff, accented notes (velocity) opening it further and
+## louder, a little glide; one voice.
+func build_tb_acid(p: Patcher):
+    let note = p.add("Note In", 0.0, 0.0)
+    let glide = p.add("Glide", 1.0, 0.0, {"Time": 0.03})
+    let saw = p.add("Analog VCO", 2.0, 0.0, {"Shape": 0.5, "Level": 0.55, "Drift": 1.5})
+    let snap = contour(p, note, 2.0, 2.0, {"Attack": 0.001, "Decay": 0.22, "Sustain": 0.0, "Release": 0.08, "Velocity": 0.9})
+    let amount = p.add("Mix", 3.0, 2.0, {"Gain A": 3.2})
+    let diode = p.add("Diode Ladder", 4.0, 0.0, {"Cutoff": 320.0, "Resonance": 0.8, "Drive": 4.0})
+    let loudness = contour(p, note, 4.0, 2.0, {"Attack": 0.001, "Decay": 0.6, "Sustain": 0.6, "Release": 0.03, "Velocity": 0.5})
+    let vca = p.add("OTA VCA", 5.0, 0.0, {"Drive": 3.0})
+    let out = p.add("Output", 6.0, 0.0, {"Gain": -4.0})
+    p.wire(note, "pitch", glide, "in")
+    p.wire(glide, "out", saw, "pitch")
+    p.wire(snap, "out", amount, "a")
+    p.wire(saw, "out", diode, "in")
+    p.wire(amount, "out", diode, "cutoff")
+    p.wire(diode, "out", vca, "in")
+    p.wire(loudness, "out", vca, "cv")
+    p.wire(vca, "out", out, "left")
+
+## An Analog Rytm voice: a drum machine into the Rytm's own overdrive and
+## multimode filter.
+func build_rytm(p: Patcher, drum: str, settings: map[str, float], drive: float, mode: float, cutoff: float):
+    let note = p.add("Note In", 0.0, 0.0)
+    let voice = p.add(drum, 1.0, 0.0, settings)
+    let over = p.add("Drive", 2.0, 0.0, {"Circuit": 0.0, "Drive": drive, "Output": -drive * 0.5, "High Cut": 20000.0})
+    let filter = p.add("Multimode", 3.0, 0.0, {"Mode": mode, "Cutoff": cutoff, "Resonance": 0.1, "Slop": 0.0})
+    let out = p.add("Output", 4.0, 0.0, {"Gain": -9.0})
+    p.wire(note, "gate", voice, "gate")
+    p.wire(note, "velocity", voice, "velocity")
+    p.wire(voice, "out", over, "in")
+    p.wire(over, "out", filter, "in")
+    p.wire(filter, "out", out, "left")
+
+# ---------------------------------------------------------------- effects
+
+func effect_chain(p: Patcher, kind: str, settings: map[str, float]):
+    let input = p.add("Audio In", 0.0, 0.0)
+    let effect = p.add(kind, 1.0, 0.0, settings)
+    let out = p.add("Output", 2.0, 0.0)
+    p.wire(input, "left", effect, "left")
+    p.wire(input, "right", effect, "right")
+    p.wire(effect, "left", out, "left")
+    p.wire(effect, "right", out, "right")
+
+## OTO BOUM: the one-knob squash into a tube drive.
+func build_boum(p: Patcher):
+    let input = p.add("Audio In", 0.0, 0.0)
+    let squash = p.add("Compressor", 1.0, 0.0, {"Squash": 0.35, "Attack": 5.0, "Release": 120.0})
+    let left = p.add("Drive", 2.0, 0.0, {"Circuit": 1.0, "Drive": 8.0, "Output": -9.0, "Low Cut": 25.0, "High Cut": 14000.0})
+    let right = p.add("Drive", 2.0, 1.0, {"Circuit": 1.0, "Drive": 8.0, "Output": -9.0, "Low Cut": 25.0, "High Cut": 14000.0})
+    let out = p.add("Output", 3.0, 0.0)
+    p.wire(input, "left", squash, "left")
+    p.wire(input, "right", squash, "right")
+    p.wire(squash, "left", left, "in")
+    p.wire(squash, "right", right, "in")
+    p.wire(left, "out", out, "left")
+    p.wire(right, "out", out, "right")
+
+## A drum bus as Com Truise and Tycho run theirs: squeezed (4:1, 10 ms,
+## 80 ms), a tube driven, a tape machine, the top rolled off at 12 kHz.
+func build_drum_bus(p: Patcher):
+    let input = p.add("Audio In", 0.0, 0.0)
+    let squeeze = p.add("Bus Comp", 1.0, 0.0, {"Model": 1.0, "Threshold": -20.0, "Ratio": 4.0, "Attack": 1.0, "Release": 80.0, "Makeup": 5.0, "Drive": 0.3, "Mix": 0.75})
+    let left = p.add("Drive", 2.0, 0.0, {"Circuit": 1.0, "Drive": 6.0, "Output": -5.0, "Low Cut": 20.0, "High Cut": 16000.0})
+    let right = p.add("Drive", 2.0, 1.0, {"Circuit": 1.0, "Drive": 6.0, "Output": -5.0, "Low Cut": 20.0, "High Cut": 16000.0})
+    let tape = p.add("Tape", 3.0, 0.0, {"Drive": 3.0, "Wow": 0.05, "Flutter": 0.1, "Tone": 12000.0})
+    let out = p.add("Output", 4.0, 0.0)
+    p.wire(input, "left", squeeze, "left")
+    p.wire(input, "right", squeeze, "right")
+    p.wire(squeeze, "left", left, "in")
+    p.wire(squeeze, "right", right, "in")
+    p.wire(left, "out", tape, "left")
+    p.wire(right, "out", tape, "right")
+    p.wire(tape, "left", out, "left")
+    p.wire(tape, "right", out, "right")
+
+## A mastering chain: a gentle EQ (the rumble cut, a breath of air), the
+## SSL bus compressor gluing at 2:1 with its side high-passed, a touch of
+## tape, the limiter holding -1 dBTP; Input on the limiter sets the loudness.
+func build_master(p: Patcher):
+    let input = p.add("Audio In", 0.0, 0.0)
+    let eq = p.add("EQ", 1.0, 0.0, {"Low Cut": 25.0, "Slope": 1.0, "High Freq": 12000.0, "High Gain": 1.0})
+    let glue = p.add("Bus Comp", 2.0, 0.0, {"Model": 0.0, "Threshold": -14.0, "Ratio": 2.0, "Attack": 30.0, "Auto": 1.0, "Knee": 4.0, "Side HPF": 90.0, "Detect": 0.4, "Makeup": 1.5})
+    let tape = p.add("Tape", 3.0, 0.0, {"Drive": 1.0, "Wow": 0.0, "Flutter": 0.0, "Bump": 1.0, "Tone": 20000.0, "Hiss": -120.0})
+    let limit = p.add("Limiter", 4.0, 0.0, {"Input": 4.0, "Ceiling": -1.0, "Release": 80.0, "Lookahead": 2.0, "Auto": 1.0})
+    let out = p.add("Output", 5.0, 0.0)
+    p.wire(input, "left", eq, "left")
+    p.wire(input, "right", eq, "right")
+    p.wire(eq, "left", glue, "left")
+    p.wire(eq, "right", glue, "right")
+    p.wire(glue, "left", tape, "left")
+    p.wire(glue, "right", tape, "right")
+    p.wire(tape, "left", limit, "left")
+    p.wire(tape, "right", limit, "right")
+    p.wire(limit, "left", out, "left")
+    p.wire(limit, "right", out, "right")
+
+## The Analog Heat: drive circuits in stereo, `circuit` chosen.
+func build_heat(p: Patcher, circuit: float):
+    let input = p.add("Audio In", 0.0, 0.0)
+    let left = p.add("Drive", 1.0, 0.0, {"Circuit": circuit, "Drive": 10.0, "Output": -6.0, "Mix": 0.8})
+    let right = p.add("Drive", 1.0, 1.0, {"Circuit": circuit, "Drive": 10.0, "Output": -6.0, "Mix": 0.8})
+    let out = p.add("Output", 2.0, 0.0)
+    p.wire(input, "left", left, "in")
+    p.wire(input, "right", right, "in")
+    p.wire(left, "out", out, "left")
+    p.wire(right, "out", out, "right")
+
+## Make a new preset's device patch by name, or answer false.
+func build_analog(p: Patcher, name: str) -> (bool, int):
+    if name == "Model D": build_model_d(p)
+    elif name == "Moog Bass":
+        build_moog_bass(p)
+        return (true, 1)
+    elif name == "OB Pad": build_ob_pad(p)
+    elif name == "CS Brass": build_cs_brass(p)
+    elif name == "Rhodes Suitcase": build_suitcase(p)
+    elif name == "MS Acid":
+        build_ms_acid(p)
+        return (true, 1)
+    elif name == "TB Acid":
+        build_tb_acid(p)
+        return (true, 1)
+    elif name == "Rytm Kick":
+        build_rytm(p, "Kick", {"Model": 0.0, "Tune": 48.0, "Decay": 0.7, "Sweep": 1.4, "Tick": 0.4}, 6.0, 0.0, 12000.0)
+        return (true, 2)
+    elif name == "Rytm 909 Kick":
+        build_rytm(p, "Kick", {"Model": 1.0, "Tune": 52.0, "Decay": 0.45, "Sweep": 2.2, "Sweep Time": 0.025, "Tick": 0.5}, 8.0, 0.0, 16000.0)
+        return (true, 2)
+    elif name == "Rytm Snare":
+        build_rytm(p, "Snare", {"Model": 1.0, "Tune": 190.0, "Snappy": 0.7}, 4.0, 4.0, 120.0)
+        return (true, 2)
+    elif name == "Rytm Hat":
+        build_rytm(p, "Metal", {"Model": 0.0, "Decay": 0.06}, 2.0, 4.0, 3000.0)
+        return (true, 4)
+    elif name == "Rytm Open Hat":
+        build_rytm(p, "Metal", {"Model": 0.0, "Decay": 0.6}, 2.0, 4.0, 3000.0)
+        return (true, 2)
+    elif name == "Rytm Clap":
+        build_rytm(p, "Clap", {"Number": 4.0}, 3.0, 4.0, 400.0)
+        return (true, 2)
+    elif name == "Rytm Tom":
+        build_rytm(p, "Snare", {"Model": 2.0, "Tune": 110.0, "Decay": 0.45, "Sweep": 0.6}, 3.0, 0.0, 9000.0)
+        return (true, 2)
+    elif name == "Rytm Cowbell":
+        build_rytm(p, "Metal", {"Model": 2.0, "Decay": 0.3}, 2.0, 0.0, 12000.0)
+        return (true, 2)
+    elif name == "Plate": effect_chain(p, "Plate", {"Decay": 2.5, "Mix": 0.25})
+    elif name == "Blade Runner Hall":
+        effect_chain(p, "Plate", {"Decay": 12.0, "Size": 1.6, "Damping": 0.45, "Mod Depth": 0.7, "Predelay": 40.0, "Mix": 0.4, "Vintage": 1.0})
+    elif name == "Tape Echo": effect_chain(p, "Echo", {"Mode": 0.0, "Time": 0.375, "Feedback": 0.45, "Mix": 0.3})
+    elif name == "BBD Echo": effect_chain(p, "Echo", {"Mode": 1.0, "Time": 0.3, "Feedback": 0.4, "Mix": 0.3, "Ping-Pong": 1.0})
+    elif name == "Juno Chorus": effect_chain(p, "Chorus", {"Mode": 1.0, "Mix": 0.5})
+    elif name == "Ensemble": effect_chain(p, "Chorus", {"Mode": 4.0, "Mix": 0.6})
+    elif name == "Dimension": effect_chain(p, "Chorus", {"Mode": 3.0, "Mix": 0.5})
+    elif name == "Suitcase Tremolo": effect_chain(p, "Tremolo", {})
+    elif name == "BOUM": build_boum(p)
+    elif name == "Heat":
+        build_heat(p, 1.0)
+    elif name == "Tape Deck": effect_chain(p, "Tape", {"Mode": 0.0, "Drive": 4.0, "Wow": 0.15, "Flutter": 0.2})
+    elif name == "Cassette": effect_chain(p, "Tape", {"Mode": 1.0, "Drive": 6.0, "Wow": 0.3, "Flutter": 0.3, "Hiss": -66.0})
+    elif name == "VHS": effect_chain(p, "Tape", {"Mode": 2.0, "Drive": 5.0, "Wow": 0.35, "Flutter": 0.2, "Bump": 3.0, "Hiss": -62.0})
+    elif name == "Pump": effect_chain(p, "Pump", {})
+    elif name == "Hall": effect_chain(p, "Hall", {"Decay": 3.5, "Mix": 0.3})
+    elif name == "Gated Hall": effect_chain(p, "Hall", {"Decay": 2.5, "Size": 0.8, "Gate": 0.32, "Damping": 7000.0, "Mix": 0.45})
+    elif name == "Wide": effect_chain(p, "Width", {"Width": 1.4, "Haas": 9.0})
+    elif name == "EQ": effect_chain(p, "EQ", {"Low Cut": 30.0})
+    elif name == "Low Cut": effect_chain(p, "EQ", {"Low Cut": 150.0, "Mid 1 Freq": 350.0, "Mid 1 Gain": -2.0, "Mid 1 Q": 1.2})
+    elif name == "Glue": effect_chain(p, "Bus Comp", {"Model": 0.0, "Threshold": -18.0, "Ratio": 4.0, "Attack": 10.0, "Release": 100.0, "Knee": 6.0, "Makeup": 3.0})
+    elif name == "SSL Bus": effect_chain(p, "Bus Comp", {"Model": 0.0, "Threshold": -16.0, "Ratio": 2.0, "Attack": 30.0, "Auto": 1.0, "Knee": 3.0, "Side HPF": 90.0, "Makeup": 2.0})
+    elif name == "FET Smash": effect_chain(p, "Bus Comp", {"Model": 1.0, "Threshold": -30.0, "Ratio": 20.0, "Attack": 0.1, "Release": 100.0, "Knee": 2.0, "Detect": 0.0, "Makeup": 12.0, "Drive": 0.6, "Mix": 0.35})
+    elif name == "Opto Leveler": effect_chain(p, "Bus Comp", {"Model": 2.0, "Threshold": -22.0, "Ratio": 3.0, "Attack": 10.0, "Release": 1500.0, "Knee": 10.0, "Detect": 0.7, "Makeup": 4.0, "Drive": 0.2})
+    elif name == "Vari-Mu": effect_chain(p, "Bus Comp", {"Model": 3.0, "Threshold": -16.0, "Ratio": 2.5, "Attack": 25.0, "Release": 600.0, "Detect": 0.8, "Makeup": 2.0, "Drive": 0.4})
+    elif name == "Limiter": effect_chain(p, "Limiter", {})
+    elif name == "Master": build_master(p)
+    elif name == "Drum Bus": build_drum_bus(p)
+    elif name == "Cathedral": effect_chain(p, "Hall", {"Decay": 12.0, "Size": 2.2, "Predelay": 40.0, "Damping": 4000.0, "Mod Depth": 0.6, "Low Cut": 200.0, "Mix": 0.6, "Shimmer": 0.15})
+    elif name == "Freq Shift": effect_chain(p, "Freq Shifter", {"Shift": 6.0, "Mix": 0.5})
+    elif name == "Phaser": effect_chain(p, "Phaser", {})
+    elif name == "Flanger": effect_chain(p, "Flanger", {})
+    elif name == "Lo-Fi":
+        let input = p.add("Audio In", 0.0, 0.0)
+        let left = p.add("Lo-Fi", 1.0, 0.0)
+        let right = p.add("Lo-Fi", 1.0, 1.0)
+        let out = p.add("Output", 2.0, 0.0)
+        p.wire(input, "left", left, "in")
+        p.wire(input, "right", right, "in")
+        p.wire(left, "out", out, "left")
+        p.wire(right, "out", out, "right")
+    else:
+        return (false, 0)
+    let effects = ["Plate", "Blade Runner Hall", "Tape Echo", "BBD Echo", "Juno Chorus", "Ensemble", "Dimension", "Suitcase Tremolo", "BOUM", "Heat", "Phaser", "Flanger", "Lo-Fi",
+                   "Tape Deck", "Cassette", "VHS", "Pump", "Hall", "Gated Hall", "Wide",
+                   "EQ", "Low Cut", "Glue", "Drum Bus", "Cathedral", "Freq Shift",
+                   "SSL Bus", "FET Smash", "Opto Leveler", "Vari-Mu", "Limiter", "Master"]
+    return (true, 1 if name in effects else 8)
+
+# ---------------------------------------------------------------- retro voices
+
+## A subtractive voice: oscillators (each a VCO's settings) mixed, driven
+## (`drive` dB, 0 none), through `filter` swept `amount` octaves by its own
+## contour and `control` octaves by Control In 1, into an OTA VCA on the
+## loudness contour. Optional: glide (s); vibrato of `vibrato` cents at
+## `vibrato_rate` faded in over `vibrato_delay` s; pulse width swept by an
+## LFO (`pwm` deep at `pwm_rate`); a slow smooth random wander of `wander`
+## cents (each part skewed at its own pace, Com Truise's "skewing").
+func subtractive(p: Patcher, oscs: list[map[str, float]], filter: str, filter_settings: map[str, float],
+                 sweep: map[str, float], amount: float, loud: map[str, float], gain: float,
+                 glide: float = 0.0, vibrato: float = 0.0, vibrato_rate: float = 5.2, vibrato_delay: float = 1.0,
+                 pwm: float = 0.0, pwm_rate: float = 0.4, drive: float = 0.0, control: float = 0.0, wander: float = 0.0):
+    let note = p.add("Note In", 0.0, 0.0)
+    var pitch = note
+    var pitch_port = "pitch"
+    if glide > 0.0:
+        pitch = p.add("Glide", 1.0, 0.0, {"Time": glide})
+        p.wire(note, "pitch", pitch, "in")
+        pitch_port = "out"
+    var bend: GraphNode? = none
+    if vibrato > 0.0 or wander > 0.0:
+        let sum = p.add("Mix", 1.0, 3.0)
+        bend = sum
+        if vibrato > 0.0:
+            let lfo = p.add("LFO", 0.0, 3.0, {"Wave": 0.0, "Rate": vibrato_rate, "Depth": vibrato / 1200.0})
+            let fade = p.add("Envelope", 0.0, 4.0, {"Attack": vibrato_delay, "Decay": 0.1, "Sustain": 1.0, "Release": 0.3})
+            let depth = p.add("Multiply", 1.0, 4.0)
+            p.wire(note, "gate", fade, "gate")
+            p.wire(lfo, "out", depth, "a")
+            p.wire(fade, "out", depth, "b")
+            p.wire(depth, "out", sum, "a")
+        if wander > 0.0:
+            let drift = p.add("Tempo LFO", 0.0, 5.0, {"Wave": 6.0, "Rate": 8.0, "Depth": wander / 1200.0})
+            p.wire(drift, "out", sum, "b")
+    var width: GraphNode? = none
+    if pwm > 0.0:
+        width = p.add("LFO", 1.0, 5.0, {"Wave": 1.0, "Rate": pwm_rate, "Depth": pwm})
+    let mixer = p.add("Mix", 3.0, 0.0)
+    let inputs = ["a", "b", "c", "d"]
+    for at in 0..<oscs.length:
+        let vco = p.add("Analog VCO", 2.0, float(at), oscs[at])
+        p.wire(pitch, pitch_port, vco, "pitch")
+        if let sum = bend:
+            p.wire(sum, "out", vco, "fm")
+        if let lfo = width:
+            p.wire(lfo, "out", vco, "width")
+        p.wire(vco, "out", mixer, inputs[at])
+    var source = mixer
+    if drive > 0.0:
+        source = p.add("Drive", 4.0, 1.0, {"Circuit": 0.0, "Drive": drive, "Output": -drive * 0.5, "High Cut": 18000.0})
+        p.wire(mixer, "out", source, "in")
+    let filter_contour = contour(p, note, 3.0, 2.0, sweep)
+    let moves = p.add("Mix", 4.0, 2.0, {"Gain A": amount, "Gain B": control})
+    p.wire(filter_contour, "out", moves, "a")
+    if control != 0.0:
+        let knob = p.add("Control In", 3.0, 3.0)
+        p.wire(knob, "value", moves, "b")
+    let shaper = p.add(filter, 5.0, 0.0, filter_settings)
+    p.wire(source, "out", shaper, "in")
+    p.wire(moves, "out", shaper, "cutoff")
+    let loudness = contour(p, note, 5.0, 2.0, loud)
+    let vca = p.add("OTA VCA", 6.0, 0.0)
+    let out = p.add("Output", 7.0, 0.0, {"Gain": gain})
+    p.wire(shaper, "out", vca, "in")
+    p.wire(loudness, "out", vca, "cv")
+    p.wire(vca, "out", out, "left")
+
+## A supersaw into a ladder per side, on one contour.
+func build_supersaw(p: Patcher, cutoff: float, amount: float, loud: map[str, float], gain: float):
+    let note = p.add("Note In", 0.0, 0.0)
+    let saws = p.add("Supersaw", 1.0, 0.0, {"Detune": 0.3, "Mix": 0.65, "Spread": 0.9})
+    let sweep = contour(p, note, 1.0, 2.0, {"Attack": 0.005, "Decay": 0.6, "Sustain": 0.4, "Release": 0.4, "Velocity": 0.3})
+    let moves = p.add("Mix", 2.0, 2.0, {"Gain A": amount})
+    let left = p.add("Ladder", 3.0, 0.0, {"Cutoff": cutoff, "Resonance": 0.15})
+    let right = p.add("Ladder", 3.0, 1.0, {"Cutoff": cutoff, "Resonance": 0.15})
+    let loudness = contour(p, note, 3.0, 2.0, loud)
+    let vca_left = p.add("OTA VCA", 4.0, 0.0)
+    let vca_right = p.add("OTA VCA", 4.0, 1.0)
+    let out = p.add("Output", 5.0, 0.0, {"Gain": gain})
+    p.wire(note, "pitch", saws, "pitch")
+    p.wire(sweep, "out", moves, "a")
+    p.wire(saws, "left", left, "in")
+    p.wire(saws, "right", right, "in")
+    p.wire(moves, "out", left, "cutoff")
+    p.wire(moves, "out", right, "cutoff")
+    p.wire(left, "out", vca_left, "in")
+    p.wire(right, "out", vca_right, "in")
+    p.wire(loudness, "out", vca_left, "cv")
+    p.wire(loudness, "out", vca_right, "cv")
+    p.wire(vca_left, "out", out, "left")
+    p.wire(vca_right, "out", out, "right")
+
+## A DX7 voice: FM Operators (each its settings) played by the note,
+## wired as an algorithm: `links` (modulator, carrier) pairs, `carriers`
+## the ones heard, mixed into the output.
+func build_dx(p: Patcher, ops: list[map[str, float]], links: list[(int, int)], carriers: list[int], gain: float):
+    let note = p.add("Note In", 0.0, 0.0)
+    let nodes: list[GraphNode] = []
+    for at in 0..<ops.length:
+        let op = p.add("FM Operator", 2.0 + float(at % 3), float(at // 3) * 1.5, ops[at])
+        p.wire(note, "pitch", op, "pitch")
+        p.wire(note, "gate", op, "gate")
+        p.wire(note, "velocity", op, "velocity")
+        nodes.append(op)
+    let ports = ["a", "b", "c", "d"]
+    for target in 0..<ops.length:
+        let sources = links.filter((link) => link.1 == target)
+        if sources.length == 1:
+            p.wire(nodes[sources[0].0], "out", nodes[target], "mod")
+        elif sources.length > 1:
+            let sum = p.add("Mix", 1.0, float(target))
+            for k in 0..<sources.length:
+                p.wire(nodes[sources[k].0], "out", sum, ports[k])
+            p.wire(sum, "out", nodes[target], "mod")
+    let mixer = p.add("Mix", 5.0, 0.0)
+    for k in 0..<carriers.length:
+        p.wire(nodes[carriers[k]], "out", mixer, ports[k])
+    let out = p.add("Output", 6.0, 0.0, {"Gain": gain})
+    p.wire(mixer, "out", out, "left")
+
+func fm_op(ratio: float, level: float, attack: float, decay: float, sustain: float, release: float,
+        feedback: float = 0.0, detune: float = 0.0, velocity: float = 0.5, key_scale: float = 0.0, fixed: float = 0.0) -> map[str, float]:
+    return {"Ratio": ratio, "Level": level, "Attack": attack, "Decay": decay, "Sustain": sustain, "Release": release,
+            "Feedback": feedback, "Detune": detune, "Velocity": velocity, "Key Scale": key_scale, "Fixed": fixed}
+
+## One drum of an early-80s sample machine.
+func build_machine(p: Patcher, model: float, settings: map[str, float], gain: float, tuned: bool = false):
+    let note = p.add("Note In", 0.0, 0.0)
+    let all = settings.copy()
+    all["Model"] = model
+    let voice = p.add("Drum Machine", 1.0, 0.0, all)
+    let out = p.add("Output", 2.0, 0.0, {"Gain": gain})
+    p.wire(note, "gate", voice, "gate")
+    p.wire(note, "velocity", voice, "velocity")
+    if tuned:
+        p.wire(note, "pitch", voice, "pitch")
+    p.wire(voice, "out", out, "left")
+
+func vco_saw(fine: float = 0.0, level: float = 0.4, octave: float = 0.0, drift: float = 3.0) -> map[str, float]:
+    return {"Shape": 0.5, "Fine": fine, "Level": level, "Octave": octave, "Drift": drift}
+
+func vco_pulse(width: float = 0.5, fine: float = 0.0, level: float = 0.35, octave: float = 0.0, drift: float = 3.0) -> map[str, float]:
+    return {"Shape": 1.0, "Pulse Width": width, "Fine": fine, "Level": level, "Octave": octave, "Drift": drift}
+
+func vco_triangle(level: float = 0.5, octave: float = 0.0, drift: float = 2.0) -> map[str, float]:
+    return {"Shape": 0.0, "Level": level, "Octave": octave, "Drift": drift}
+
+func adsr(attack: float, decay: float, sustain: float, release: float, velocity: float = 0.4) -> map[str, float]:
+    return {"Attack": attack, "Decay": decay, "Sustain": sustain, "Release": release, "Velocity": velocity}
+
+## The retro voices by name, and how many voices each plays; (false, 0)
+## when `name` is none of them.
+func build_retro(p: Patcher, name: str) -> (bool, int):
+    if name == "Juno Stab":
+        subtractive(p, [vco_saw(level = 0.45, drift = 1.0), vco_pulse(level = 0.15, octave = -1.0, drift = 1.0)], "Ladder", {"Cutoff": 300.0, "Resonance": 0.2},
+                    adsr(0.001, 0.35, 0.0, 0.25, 0.5), 4.5, adsr(0.002, 0.4, 0.0, 0.3, 0.5), 4.0, wander = 4.0)
+    elif name == "Juno Arp":
+        subtractive(p, [vco_pulse(width = 0.45, level = 0.5, drift = 1.0)], "Ladder", {"Cutoff": 600.0, "Resonance": 0.25},
+                    adsr(0.001, 0.25, 0.15, 0.2, 0.5), 3.0, adsr(0.002, 0.35, 0.2, 0.3, 0.6), -3.0, pwm = 0.3, pwm_rate = 0.4, control = 3.0)
+    elif name == "Prophet Pluck":
+        subtractive(p, [vco_saw(fine = -7.5), vco_saw(fine = 7.5)], "Ladder", {"Cutoff": 250.0, "Resonance": 0.55, "Drive": 3.0},
+                    adsr(0.001, 0.2, 0.0, 0.2, 0.5), 5.0, adsr(0.001, 0.45, 0.0, 0.35, 0.5), 0.0, control = 3.0, wander = 5.0)
+    elif name == "Prophet Strings":
+        subtractive(p, [vco_saw(fine = -10.0, level = 0.35, drift = 5.0), vco_pulse(width = 0.83, fine = 10.0, level = 0.3, drift = 5.0)], "Ladder", {"Cutoff": 300.0, "Resonance": 0.15},
+                    adsr(0.03, 4.0, 0.2, 2.0, 0.3), 3.5, adsr(0.25, 1.0, 0.9, 1.5, 0.3), -6.0, wander = 4.0)
+    elif name == "Xpander Pad":
+        subtractive(p, [vco_saw(fine = -12.0, level = 0.35, drift = 5.0), vco_saw(fine = 12.0, level = 0.35, drift = 5.0)], "SEM", {"Cutoff": 900.0, "Resonance": 0.3, "Mode": 0.0},
+                    adsr(1.5, 2.5, 0.5, 3.0, 0.2), -1.5, adsr(1.5, 1.0, 0.9, 3.0, 0.2), -1.0, wander = 5.0)
+    elif name == "Mini Lead":
+        subtractive(p, [vco_triangle(level = 0.55), vco_saw(level = 0.15, octave = -1.0)], "Ladder", {"Cutoff": 900.0, "Resonance": 0.2, "Drive": 3.0},
+                    adsr(0.005, 0.25, 0.35, 0.3, 0.5), 2.5, adsr(0.005, 0.4, 0.8, 0.35, 0.5), 1.0, glide = 0.04, vibrato = 8.0, vibrato_rate = 5.0, vibrato_delay = 0.8)
+        return (true, 1)
+    elif name == "Monster Bass":
+        subtractive(p, [vco_pulse(level = 0.45, drift = 1.0), vco_pulse(level = 0.25, octave = -1.0, drift = 1.0)], "Ladder", {"Cutoff": 200.0, "Resonance": 0.3, "Drive": 5.0, "Bass": 0.6},
+                    adsr(0.001, 0.4, 0.1, 0.15, 0.6), 3.0, adsr(0.002, 0.5, 0.7, 0.1, 0.5), -3.0, glide = 0.015)
+        return (true, 1)
+    elif name == "Octave Bass":
+        subtractive(p, [vco_saw(level = 0.4, drift = 2.0), vco_saw(level = 0.35, octave = -1.0, drift = 2.0)], "Ladder", {"Cutoff": 350.0, "Resonance": 0.4, "Drive": 4.0},
+                    adsr(0.002, 2.5, 0.3, 0.3, 0.4), 2.0, adsr(0.002, 0.5, 0.85, 0.15, 0.4), 0.0, vibrato = 15.0, vibrato_rate = 5.2, vibrato_delay = 1.5)
+        return (true, 1)
+    elif name == "Sync Lead":
+        build_sync_lead(p)
+        return (true, 1)
+    elif name == "Truise Lead":
+        subtractive(p, [vco_saw(level = 0.35, drift = 4.0), vco_pulse(width = 0.4, fine = 6.0, level = 0.3, drift = 4.0)], "SEM", {"Cutoff": 1800.0, "Resonance": 0.25},
+                    adsr(0.005, 0.6, 0.6, 0.5, 0.4), 1.2, adsr(0.01, 0.5, 0.85, 0.6, 0.4), -2.0, glide = 0.05, vibrato = 6.0, vibrato_rate = 0.85, vibrato_delay = 0.3, pwm = 0.2, pwm_rate = 0.85, wander = 5.0)
+        return (true, 1)
+    elif name == "Pedal Bass":
+        subtractive(p, [vco_saw(level = 0.4, drift = 2.0), vco_pulse(level = 0.35, octave = -1.0, fine = 4.0, drift = 2.0)], "Ladder", {"Cutoff": 250.0, "Resonance": 0.25, "Drive": 3.0},
+                    adsr(0.002, 0.28, 0.0, 0.12, 0.5), 2.2, adsr(0.001, 0.2, 1.0, 0.08, 0.4), -1.0)
+        return (true, 1)
+    elif name == "Mother Arp":
+        subtractive(p, [vco_pulse(width = 0.4, level = 0.5, drift = 2.0)], "Ladder", {"Cutoff": 400.0, "Resonance": 0.45},
+                    adsr(0.0, 0.16, 0.1, 0.15, 0.7), 2.0, adsr(0.001, 0.25, 0.3, 0.15, 0.5), -4.0, pwm = 0.2, pwm_rate = 0.3, control = 3.5)
+    elif name == "DX Glass":
+        build_dx(p, [fm_op(1.0, 0.45, 0.001, 3.0, 0.25, 1.5), fm_op(3.5, 0.5, 0.001, 0.5, 0.1, 0.8, velocity = 0.8),
+                     fm_op(1.0, 0.25, 0.001, 2.0, 0.3, 1.5, detune = 7.0), fm_op(14.0, 0.18, 0.001, 0.12, 0.0, 0.2, velocity = 0.9)],
+                 [(1, 0), (3, 2)], [0, 2], -7.0)
+    elif name == "DX Piano":
+        # Algorithm 5's three pairs: the body, the tine's ding (14:1), a
+        # breathy third pair with feedback.
+        build_dx(p, [fm_op(1.0, 0.5, 0.001, 2.8, 0.0, 0.4, velocity = 0.6, key_scale = 0.3),
+                     fm_op(1.0, 0.35, 0.001, 1.6, 0.05, 0.4, velocity = 0.9, key_scale = 0.4),
+                     fm_op(1.0, 0.3, 0.001, 2.2, 0.0, 0.4, detune = 4.0, velocity = 0.6),
+                     fm_op(14.0, 0.22, 0.001, 0.25, 0.0, 0.2, velocity = 1.0, key_scale = 0.6),
+                     fm_op(1.0, 0.15, 0.001, 1.5, 0.0, 0.4, detune = -4.0),
+                     fm_op(1.0, 0.25, 0.001, 0.8, 0.0, 0.3, feedback = 0.6)],
+                 [(1, 0), (3, 2), (5, 4)], [0, 2, 4], -7.0)
+    elif name == "DX Bass":
+        build_dx(p, [fm_op(0.5, 0.7, 0.001, 1.2, 0.3, 0.12, velocity = 0.5),
+                     fm_op(0.5, 0.9, 0.001, 0.35, 0.15, 0.1, feedback = 0.5, velocity = 0.8),
+                     fm_op(1.5, 0.35, 0.001, 0.08, 0.0, 0.05, velocity = 0.9)],
+                 [(1, 0), (2, 0)], [0], -3.0)
+        return (true, 1)
+    elif name == "DX Brass":
+        build_dx(p, [fm_op(1.0, 0.45, 0.06, 1.0, 0.85, 0.3), fm_op(1.0, 0.55, 0.12, 0.8, 0.6, 0.3, feedback = 0.4, velocity = 0.7),
+                     fm_op(1.0, 0.35, 0.05, 1.0, 0.85, 0.3, detune = 6.0), fm_op(1.0, 0.45, 0.15, 0.9, 0.55, 0.3, velocity = 0.7)],
+                 [(1, 0), (3, 2)], [0, 2], -9.0)
+    elif name == "DX Bells":
+        build_dx(p, [fm_op(1.0, 0.45, 0.001, 4.0, 0.0, 3.0), fm_op(3.5, 0.6, 0.001, 2.0, 0.0, 2.0, velocity = 0.7),
+                     fm_op(2.0, 0.2, 0.001, 3.0, 0.0, 2.5, detune = 3.0), fm_op(7.07, 0.3, 0.001, 1.0, 0.0, 1.0)],
+                 [(1, 0), (3, 2)], [0, 2], -6.0)
+    elif name == "Drone":
+        subtractive(p, [vco_saw(fine = -7.0, level = 0.35, drift = 6.0), vco_saw(fine = 7.0, level = 0.35, drift = 6.0), vco_triangle(level = 0.4, octave = -1.0)], "Ladder", {"Cutoff": 600.0, "Resonance": 0.15},
+                    adsr(2.0, 1.0, 1.0, 4.0, 0.0), 0.0, adsr(3.0, 1.0, 1.0, 5.0, 0.0), -4.0, control = 2.0, wander = 8.0)
+        return (true, 2)
+    elif name == "Howl Lead":
+        subtractive(p, [vco_saw(level = 0.5, drift = 8.0)], "Ladder", {"Cutoff": 1400.0, "Resonance": 0.25, "Drive": 6.0},
+                    adsr(0.05, 1.0, 0.6, 1.0, 0.3), 1.2, adsr(0.08, 0.5, 0.9, 1.2, 0.3), -3.0, glide = 0.45, vibrato = 15.0, vibrato_rate = 5.0, vibrato_delay = 1.0, drive = 14.0, wander = 30.0)
+        return (true, 1)
+    elif name == "Rival Pulse":
+        subtractive(p, [vco_saw(level = 0.35, drift = 4.0), vco_pulse(width = 0.35, fine = 4.0, level = 0.35, drift = 4.0)], "Ladder", {"Cutoff": 500.0, "Resonance": 0.3, "Drive": 4.0},
+                    adsr(0.0, 0.18, 0.0, 0.12, 0.9), 3.0, adsr(0.001, 0.3, 0.2, 0.15, 0.5), -1.0, pwm = 0.15, pwm_rate = 0.2, control = 3.0)
+    elif name == "Chord Pad":
+        subtractive(p, [vco_saw(fine = -6.0, level = 0.35, drift = 7.0), vco_saw(fine = 6.0, level = 0.35, drift = 7.0)], "Ladder", {"Cutoff": 1200.0, "Resonance": 0.1},
+                    adsr(1.5, 2.0, 0.6, 3.0, 0.2), 0.8, adsr(1.5, 1.0, 0.9, 3.0, 0.2), -6.0, control = 2.0, wander = 6.0)
+    elif name == "Stacked Mono":
+        subtractive(p, [vco_saw(fine = -3.0, level = 0.3, drift = 6.0), vco_saw(fine = 3.0, level = 0.3, drift = 6.0), vco_pulse(level = 0.25, octave = -1.0, drift = 6.0)], "Ladder", {"Cutoff": 900.0, "Resonance": 0.2, "Drive": 2.0},
+                    adsr(0.01, 0.8, 0.4, 0.6, 0.3), 1.5, adsr(0.01, 0.6, 0.85, 0.7, 0.3), -8.0, wander = 4.0)
+    elif name == "Supersaw":
+        build_supersaw(p, 2500.0, 2.0, adsr(0.005, 0.5, 0.85, 0.5, 0.3), -6.0)
+    elif name == "Linn Kick": build_machine(p, 0.0, {"Tune": -1.0, "Decay": 1.1}, -5.0)
+    elif name == "Linn Snare": build_machine(p, 1.0, {"Tune": 0.0, "Decay": 1.2, "Tone": 0.6}, -3.0)
+    elif name == "Linn Tom": build_machine(p, 2.0, {"Tune": 0.0}, -4.0, tuned = true)
+    elif name == "Linn Hat": build_machine(p, 3.0, {"Tone": 0.6}, 3.0)
+    elif name == "Linn Open Hat": build_machine(p, 4.0, {"Tone": 0.6}, -1.0)
+    elif name == "Linn Clap": build_machine(p, 5.0, {"Decay": 1.3}, -4.0)
+    elif name == "Linn Rim": build_machine(p, 6.0, {}, -3.0)
+    elif name == "Tambourine": build_machine(p, 7.0, {}, -1.0)
+    elif name == "Shaker": build_machine(p, 8.0, {}, -1.0)
+    elif name == "Linn Cowbell": build_machine(p, 9.0, {}, -4.0)
+    else:
+        return (false, 0)
+    return (true, 4 if name.starts_with("Linn") or name == "Tambourine" or name == "Shaker" else 8)
+
+## The Odd Look kind of lead: two pulses, the second hard-synced to the
+## first a major sixth up and swept by its contour (the scream), driven hard.
+func build_sync_lead(p: Patcher):
+    let note = p.add("Note In", 0.0, 0.0)
+    let glide = p.add("Glide", 1.0, 0.0, {"Time": 0.03})
+    let master = p.add("Analog VCO", 2.0, 0.0, {"Shape": 1.0, "Pulse Width": 0.5, "Level": 0.0, "Drift": 2.0})
+    let slave = p.add("Analog VCO", 2.0, 1.0, {"Shape": 0.75, "Semitones": 9.0, "Level": 0.45, "Drift": 2.0})
+    let partner = p.add("Analog VCO", 2.0, 2.0, {"Shape": 0.5, "Fine": 9.0, "Level": 0.25, "Drift": 3.0})
+    let scream = contour(p, note, 1.0, 3.0, adsr(0.002, 0.5, 0.2, 0.3, 0.5))
+    let sweep = p.add("Mix", 2.0, 3.0, {"Gain A": 1.0})
+    let mixer = p.add("Mix", 3.0, 0.0)
+    let hot = p.add("Drive", 4.0, 0.0, {"Circuit": 1.0, "Drive": 12.0, "Output": -8.0, "Low Cut": 180.0, "High Cut": 12000.0})
+    let ladder = p.add("Ladder", 5.0, 0.0, {"Cutoff": 3000.0, "Resonance": 0.15})
+    let loudness = contour(p, note, 5.0, 2.0, adsr(0.003, 0.3, 0.85, 0.3, 0.4))
+    let vca = p.add("OTA VCA", 6.0, 0.0)
+    let out = p.add("Output", 7.0, 0.0, {"Gain": 0.0})
+    p.wire(note, "pitch", glide, "in")
+    p.wire(glide, "out", master, "pitch")
+    p.wire(glide, "out", slave, "pitch")
+    p.wire(glide, "out", partner, "pitch")
+    p.wire(master, "out", slave, "sync")
+    p.wire(scream, "out", sweep, "a")
+    p.wire(sweep, "out", slave, "fm")
+    p.wire(slave, "out", mixer, "a")
+    p.wire(partner, "out", mixer, "b")
+    p.wire(mixer, "out", hot, "in")
+    p.wire(hot, "out", ladder, "in")
+    p.wire(ladder, "out", vca, "in")
+    p.wire(loudness, "out", vca, "cv")
+    p.wire(vca, "out", out, "left")
+
+# ---------------------------------------------------------------- demo songs
+
+## A track with a notes lane playing `instrument` through `effects` in
+## order into the track's output; answers the lane.
+pub func instrument_track(song: Song, name: str, instrument: str, effects: list[str], volume: float = 0.0, pan: float = 0.0) -> Lane:
+    let track = song.add_track(name)
+    track.volume = volume
+    track.pan = pan
+    let lane = song.add_lane(track, name, false)
+    let device = make(song, instrument, 260.0, 30.0)
+    track.rack.nodes.append(device)
+    if let node = song.lane_node(track, lane.id):
+        patch_rack(track, node, 0, device, catalog.device_notes)
+    var last = device
+    var x = 500.0
+    for effect in effects:
+        let next = make(song, effect, x, 30.0)
+        track.rack.nodes.append(next)
+        patch_rack(track, last, 0, next, catalog.device_audio)
+        last = next
+        x += 240.0
+    if let out = song.output_of(track):
+        out.x = x
+        patch_rack(track, last, 0, out, catalog.output_audio)
+    return lane
+
+## A drum lane on `track` playing `instrument`, its device to the output.
+pub func drum_lane(song: Song, track: Track, name: str, instrument: str, row: int) -> Lane:
+    let lane = song.add_lane(track, name, false)
+    _ = add_device(song, track, instrument, lane, row)
+    return lane
+
+pub func clip_of(song: Song, lane: Lane, name: str, length: float, notes: list[(float, float, int, float)]) -> Clip:
+    let clip = Clip(song.next_id(), name, 0.0, length)
+    for (beat, duration, pitch, velocity) in notes:
+        clip.notes.append(Note(start = beat, length = duration, pitch = pitch, velocity = velocity))
+    lane.clips.append(clip)
+    return clip
+
+## Slow brass chords into a long dark hall, a Rhodes answering, a soft bass.
+pub func blade_runner_song() -> Song:
+    let song = Song()
+    song.name = "Blade Runner"
+    song.tempo = 70.0
+    song.loop_on = true
+    song.loop_end = 32.0
+    let brass = instrument_track(song, "CS Brass", "CS Brass", ["Ensemble", "Blade Runner Hall"], -2.0)
+    let rhodes = instrument_track(song, "Rhodes", "Rhodes Suitcase", ["Dimension", "Plate"], -4.0, 0.15)
+    let bass = instrument_track(song, "Bass", "Moog Bass", ["Plate"], -8.0)
+    let chords = [[57, 60, 64, 71], [53, 57, 60, 64], [55, 59, 62, 67], [52, 55, 59, 64]]
+    let roots = [33, 29, 31, 28]
+    let brass_notes: list[(float, float, int, float)] = []
+    let rhodes_notes: list[(float, float, int, float)] = []
+    let bass_notes: list[(float, float, int, float)] = []
+    for bar in 0..<4:
+        let start = float(bar * 8)
+        for pitch in chords[bar]:
+            brass_notes.append((start, 7.6, pitch, 0.75))
+        let figure = [chords[bar][0] + 12, chords[bar][2] + 12, chords[bar][3] + 12, chords[bar][1] + 12]
+        for step in 0..<4:
+            rhodes_notes.append((start + 1.0 + float(step) * 1.5, 1.2, figure[step], 0.45 + 0.15 * float(step % 2)))
+        bass_notes.append((start, 3.8, roots[bar], 0.7))
+        bass_notes.append((start + 4.0, 3.8, roots[bar] + 7, 0.6))
+    _ = clip_of(song, brass, "Swell", 32.0, brass_notes)
+    _ = clip_of(song, rhodes, "Answers", 32.0, rhodes_notes)
+    _ = clip_of(song, bass, "Ground", 32.0, bass_notes)
+    return song
+
+## Four bars at 124: a Rytm kit through BOUM, an MS-20 acid line through tape
+## echo, a Model D lead into a BBD ping-pong, an OB pad in a plate.
+pub func elektron_song() -> Song:
+    let song = Song()
+    song.name = "Elektron"
+    song.tempo = 124.0
+    song.loop_on = true
+    song.loop_end = 16.0
+    let drums = song.add_track("Drums")
+    let kick = drum_lane(song, drums, "Kick", "Rytm Kick", 0)
+    let snare = drum_lane(song, drums, "Clap", "Rytm Clap", 1)
+    let hat = drum_lane(song, drums, "Hat", "Rytm Hat", 2)
+    let open = drum_lane(song, drums, "Open Hat", "Rytm Open Hat", 3)
+    # The kit through BOUM on its way out.
+    let boum = make(song, "BOUM", 520.0, 120.0)
+    drums.rack.nodes.append(boum)
+    if let out = song.output_of(drums):
+        out.x = 760.0
+        drums.rack.wires = drums.rack.wires.filter((w) => w.target != out.id)
+        for node in drums.rack.nodes:
+            if node.kind == catalog.device_kind and node.id != boum.id:
+                patch_rack(drums, node, 0, boum, catalog.device_audio)
+        patch_rack(drums, boum, 0, out, catalog.output_audio)
+    let kicks: list[(float, float, int, float)] = []
+    let claps: list[(float, float, int, float)] = []
+    let hats: list[(float, float, int, float)] = []
+    let opens: list[(float, float, int, float)] = []
+    for beat in 0..<16:
+        kicks.append((float(beat), 0.2, 36, 0.9))
+        if beat % 2 == 1:
+            claps.append((float(beat), 0.2, 39, 0.8))
+        for sixteenth in 0..<4:
+            if sixteenth != 2:
+                hats.append((float(beat) + 0.25 * float(sixteenth), 0.1, 42, 0.9 if sixteenth == 0 else 0.45))
+        opens.append((float(beat) + 0.5, 0.2, 46, 0.6))
+    _ = clip_of(song, kick, "Four", 16.0, kicks)
+    _ = clip_of(song, snare, "Backbeat", 16.0, claps)
+    _ = clip_of(song, hat, "Sixteenths", 16.0, hats)
+    _ = clip_of(song, open, "Offbeats", 16.0, opens)
+    let acid = instrument_track(song, "Acid", "MS Acid", ["Tape Echo"], 3.0)
+    let line = [36, 36, 48, 36, 39, 36, 46, 36, 34, 36, 48, 41, 39, 36, 43, 36]
+    let accents = [1.0, 0.4, 0.9, 0.4, 0.5, 0.4, 1.0, 0.4, 0.5, 0.4, 0.9, 0.5, 0.4, 0.4, 1.0, 0.5]
+    let acid_notes: list[(float, float, int, float)] = []
+    for bar in 0..<4:
+        for step in 0..<16:
+            acid_notes.append((float(bar * 4) + 0.25 * float(step), 0.2, line[step] + (3 if bar == 2 else 0), accents[step]))
+    _ = clip_of(song, acid, "Squelch", 16.0, acid_notes)
+    let lead = instrument_track(song, "Lead", "Model D", ["BBD Echo"], 1.0, -0.25)
+    _ = clip_of(song, lead, "Hook", 16.0, [(2.0, 1.5, 72, 0.8), (3.5, 0.5, 75, 0.7), (6.0, 1.5, 70, 0.8), (7.5, 0.5, 67, 0.6),
+                                            (10.0, 1.5, 72, 0.8), (11.5, 0.5, 75, 0.7), (14.0, 2.0, 79, 0.9)])
+    let pad = instrument_track(song, "Pad", "OB Pad", ["Juno Chorus", "Plate"], 0.0, 0.25)
+    _ = clip_of(song, pad, "Chords", 16.0, [(0.0, 7.8, 60, 0.6), (0.0, 7.8, 63, 0.6), (0.0, 7.8, 67, 0.6),
+                                            (8.0, 7.8, 58, 0.6), (8.0, 7.8, 62, 0.6), (8.0, 7.8, 65, 0.6)])
+    return song

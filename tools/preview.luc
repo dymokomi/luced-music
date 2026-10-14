@@ -1,0 +1,87 @@
+## Capture the window for tools/preview.py:
+##     preview OUTPUT.ppm SCENE
+## SCENE: rack (the first track's rack), patch (its instrument's patch open),
+## clip (the lead's notes in the clip editor), curve (the cutoff curve),
+## playing (playing for a second first), scale (song keys, a track's own,
+## the lead's clip under a key).
+import probe
+import presets
+from app import LucedMusic
+import catalog
+import edits
+from song import ScaleKey
+import workspace as ws
+
+pub func main(arguments: list[str]) -> int!:
+    let scene = arguments[1] if arguments.length > 1 else "rack"
+    let music = LucedMusic(presets.demo_song(), width = 1500, height = 940)
+    let w = music.workspace
+    var ticks = 0
+    var capture = -1
+    let timer = music.app.every(0.05, func () -> unit!:
+        ticks += 1
+        if ticks == 3:
+            let track = w.song.tracks[0]
+            w.select_track(track.id)
+            if scene == "group" or scene == "inside":
+                for node in track.rack.nodes:
+                    if node.kind == catalog.device_kind and w.device < 0:
+                        w.enter(node.id)
+                        if let patch = node.patch:
+                            let picked: list[int] = []
+                            for inner in patch.nodes:
+                                if inner.kind == catalog.named("Oscillator") or (inner.kind == catalog.named("Mix") and picked.length == 2):
+                                    picked.append(inner.id)
+                            w.nodes = picked
+                            edits.collapse(w)
+                            if scene == "inside":
+                                w.enter_group(w.node)
+            if scene == "patch":
+                for node in track.rack.nodes:
+                    if node.kind == catalog.device_kind and w.device < 0:
+                        w.enter(node.id)
+                        if let patch = node.patch:
+                            w.select_node(patch.nodes[3].id)
+            if scene == "scale":
+                w.song.keys = [ScaleKey(beat = 0.0, root = 9, mode = 2), ScaleKey(beat = 8.0, root = 5, mode = 5)]
+                let other = w.song.tracks[1]
+                other.keyed = 2
+                other.keys = [ScaleKey(beat = 0.0, root = 9, mode = 11)]
+                w.bridge.dirty = true
+            if scene == "clip" or scene == "curve" or scene == "scale":
+                let lane = track.lanes[1 if scene == "curve" else 0]
+                w.select_clip(lane.clips[0].id)
+                music.panels.dock.select(music.panels.clip_panel_ref())
+                if scene == "clip":
+                    w.picked = [2, 3]
+                    w.focus = 4
+                if scene == "scale":
+                    w.key_row = ws.song_keys
+                    w.key = 1
+                    w.focus = ws.focus_key
+            if scene == "playing":
+                w.bridge.engine.play()
+                w.playing = true
+        if ticks >= 6 and scene == "playing":
+            w.bridge.engine.render(2400)
+        if ticks == 30 and capture < 0:
+            capture = 0
+        if ticks > 200:
+            music.app.stop()
+        music.panels.body.layout().invalidate())
+    let observed = music.app.on_frame(func (elapsed: float) -> unit!:
+        _ = elapsed
+        if capture == 0:
+            capture = 1
+            probe.begin(music.app.title())
+            music.panels.body.layout().invalidate()
+        elif capture == 1:
+            capture = 2
+            music.app.stop())
+    music.app.run()
+    observed.disconnect()
+    music.app.cancel(timer)
+    probe.save(arguments[0])
+    probe.end()
+    music.close()
+    return 0

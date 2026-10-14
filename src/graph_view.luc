@@ -1,0 +1,495 @@
+## The network: a track's rack (its lanes, devices and output) or, inside
+## a device, its patch of the engine's nodes. Drawn as luced-3d draws a
+## Material's shader nodes: a header, then a row a socket, outputs on the
+## right and inputs on the left, wired left to right; a socket's color is
+## what it carries. Pan with the middle button, Space-drag or a touchpad;
+## zoom with the wheel, Cmd-scroll or a pinch. Drag between sockets to
+## wire, Alt-click an input to unwire, double-click a device to open its
+## patch, Tab to add a node, Delete to remove the picked node or wire.
+from luce_ui.ui import Widget, Layout, Constraints, Size, Event, Painter, Point, Font
+from luce_gpu.gpu import RenderTarget, Rect, Color
+from luce_window.input import EventKind, Key, ScrollUnit
+from luce_std import math
+from workspace import Workspace
+from song import Graph, GraphNode, Wire, Track
+from catalog import Port
+import catalog
+import rack
+import groups
+import edits
+import theme
+import time
+
+pub let node_width: float = 176.0
+let header: float = 24.0
+let row: float = 19.0
+
+pub class GraphView: Widget:
+    let box: Layout
+    let workspace: Workspace
+    let base_font: Font
+    var font: Font
+    pub var zoom: float = 1.0
+    pub var pan_x: float = 20.0
+    pub var pan_y: float = 20.0
+    pub var pointer_x: float = 100.0
+    pub var pointer_y: float = 70.0
+    ## Tab, or the Add button: open the node menu at the pointer.
+    pub var on_search: func() -> unit!? = none
+    var mode: str = ""
+    var space: bool = false
+    var wire_node: int = -1
+    var wire_port: int = -1
+    var from_output: bool = true
+    var last_x: float = 0.0
+    var last_y: float = 0.0
+    var start_x: float = 0.0
+    var start_y: float = 0.0
+    var node_x: float = 0.0
+    var node_y: float = 0.0
+    var hovered: int = -1
+    var picked_wire: Wire? = none
+    ## A move drags every picked node: where each started.
+    var moving: list[(int, float, float)]
+    var last_click: int = 0
+    var last_node: int = -1
+    var shown_scope: int = -2
+    var frame_pending: bool = true
+
+    pub func init(self, workspace: Workspace, font: Font) -> unit!:
+        self.workspace = workspace
+        self.base_font = font
+        self.font = font
+        self.moving = []
+        self.box = Layout()
+        self.box.set_flex()
+        self.box.set_interactive(true)
+        self.box.set_focusable(true)
+        self.box.set_accepts_tab(true)
+
+    pub func layout(self) -> Layout:
+        return self.box
+
+    pub func measure(self, available: Constraints) -> Size!:
+        return Size(420.0, 220.0)
+
+    pub func to_graph(self, x: float, y: float) -> Point:
+        return Point((x - self.pan_x) / self.zoom, (y - self.pan_y) / self.zoom)
+
+    pub func to_screen(self, x: float, y: float) -> Point:
+        return Point(x * self.zoom + self.pan_x, y * self.zoom + self.pan_y)
+
+    func patch(self) -> bool:
+        return self.workspace.showing_patch()
+
+    func track(self) -> Track?:
+        return self.workspace.selected_track()
+
+    func inputs_of(self, node: GraphNode) -> list[Port]:
+        if self.patch():
+            return groups.inputs(node)
+        return rack.inputs(self.track(), node)
+
+    func outputs_of(self, node: GraphNode) -> list[Port]:
+        if self.patch():
+            return groups.outputs(node)
+        return rack.outputs(self.track(), node)
+
+    func height_of(self, node: GraphNode) -> float:
+        let rows = self.inputs_of(node).length + self.outputs_of(node).length
+        return header + row * float(rows) + 6.0
+
+    ## Where the socket of slot `port` sits (its row among the ports shown).
+    pub func port_point(self, node: GraphNode, output: bool, port: int) -> Point:
+        let outs = self.outputs_of(node)
+        let ports = outs if output else self.inputs_of(node)
+        var row_index = port
+        for index in 0..<ports.length:
+            if ports[index].slot == port:
+                row_index = index
+        let at = float(row_index) if output else float(outs.length + row_index)
+        return self.to_screen(node.x + (node_width if output else 0.0), node.y + header + row * (at + 0.5))
+
+    func inside(self, node: GraphNode, at: Point) -> bool:
+        return at.x >= node.x and at.x <= node.x + node_width and at.y >= node.y and at.y <= node.y + self.height_of(node)
+
+    func node_at(self, x: float, y: float) -> GraphNode?:
+        let graph = self.workspace.shown_graph() else return none
+        let at = self.to_graph(x, y)
+        for node in graph.nodes.reversed():
+            if self.inside(node, at):
+                return node
+        return none
+
+    pub func zoom_about(self, factor: float, x: float, y: float):
+        let before = self.to_graph(x, y)
+        self.zoom = math.max(0.3, math.min(2.5, self.zoom * factor))
+        self.pan_x = x - before.x * self.zoom
+        self.pan_y = y - before.y * self.zoom
+        self.box.invalidate()
+
+    ## Fit every node in view.
+    pub func frame_all(self) -> unit!:
+        let graph = self.workspace.shown_graph() else return
+        if graph.nodes.length == 0:
+            return
+        var left = graph.nodes[0].x
+        var top = graph.nodes[0].y
+        var right = left + node_width
+        var bottom = top + self.height_of(graph.nodes[0])
+        for node in graph.nodes:
+            left = math.min(left, node.x)
+            top = math.min(top, node.y)
+            right = math.max(right, node.x + node_width)
+            bottom = math.max(bottom, node.y + self.height_of(node))
+        let bounds = self.box.bounds()
+        if bounds.width <= 0.0:
+            self.frame_pending = true
+            return
+        self.zoom = math.max(0.3, math.min(1.2, math.min((bounds.width - 60.0) / (right - left), (bounds.height - 50.0) / (bottom - top))))
+        self.pan_x = (bounds.width - (right - left) * self.zoom) * 0.5 - left * self.zoom
+        self.pan_y = (bounds.height - (bottom - top) * self.zoom) * 0.5 - top * self.zoom
+        self.box.invalidate()
+
+    pub func draw(self, target: RenderTarget) -> unit!:
+        let scope = self.workspace.device if self.workspace.device >= 0 else -1 - self.workspace.track
+        if scope != self.shown_scope:
+            self.shown_scope = scope
+            self.frame_pending = true
+            self.picked_wire = none
+        if self.frame_pending and self.box.bounds().width > 0.0:
+            self.frame_pending = false
+            self.frame_all()
+        let size = target.size()
+        let p = Painter(target)
+        p.rectangle(Rect(0.0, 0.0, size.width, size.height), theme.backdrop())
+        let step = 32.0 * self.zoom
+        var x = self.pan_x - math.floor(self.pan_x / step) * step
+        while x < size.width:
+            var y = self.pan_y - math.floor(self.pan_y / step) * step
+            while y < size.height:
+                p.rectangle(Rect(x, y, 1.0, 1.0), theme.border())
+                y += step
+            x += step
+        let wanted = float(int(math.max(8.0, self.base_font.size() * self.zoom)))
+        if wanted != self.font.size():
+            self.font = self.base_font if wanted == self.base_font.size() else Font(wanted)
+        let graph_maybe = self.workspace.shown_graph()
+        if graph_maybe == none:
+            p.text("No track", 12.0, 12.0, theme.text_muted())
+            p.close()
+            return
+        let graph = graph_maybe else return
+        for wire in graph.wires:
+            if let source = graph.find(wire.source):
+                if let target_node = graph.find(wire.target):
+                    var kind = catalog.signal
+                    if let port = rack.port_at(self.outputs_of(source), wire.output):
+                        kind = port.kind
+                    var picked = false
+                    if let chosen = self.picked_wire:
+                        picked = chosen == wire
+                    self.draw_wire(p, self.port_point(source, true, wire.output), self.port_point(target_node, false, wire.input), theme.accent() if picked else theme.port_color(kind), 2.4 if picked else 1.5)
+        for node in graph.nodes:
+            self.draw_node(p, graph, node, size.width, size.height)
+        if self.mode == "wire":
+            if let node = graph.find(self.wire_node):
+                let port = self.port_point(node, self.from_output, self.wire_port)
+                let pointer = Point(self.pointer_x, self.pointer_y)
+                let ports = self.outputs_of(node) if self.from_output else self.inputs_of(node)
+                var kind = catalog.signal
+                if let carried = rack.port_at(ports, self.wire_port):
+                    kind = carried.kind
+                self.draw_wire(p, port if self.from_output else pointer, pointer if self.from_output else port, theme.port_color(kind), 1.5)
+        if self.mode == "box":
+            let a = Point(math.min(self.start_x, self.pointer_x), math.min(self.start_y, self.pointer_y))
+            let b = Point(math.max(self.start_x, self.pointer_x), math.max(self.start_y, self.pointer_y))
+            p.rectangle(Rect(a.x, a.y, b.x - a.x, b.y - a.y), Color(1.0, 1.0, 1.0, 0.06))
+            p.rectangle(Rect(a.x, a.y, b.x - a.x, 1.0), theme.text())
+            p.rectangle(Rect(a.x, b.y, b.x - a.x, 1.0), theme.text())
+            p.rectangle(Rect(a.x, a.y, 1.0, b.y - a.y), theme.text())
+            p.rectangle(Rect(b.x, a.y, 1.0, b.y - a.y + 1.0), theme.text())
+        let hint = self.hint()
+        if hint != "":
+            p.text(hint, 10.0, size.height - 22.0, theme.text_muted())
+        p.close()
+
+    func hint(self) -> str:
+        if self.hovered >= 0:
+            if let node = self.hovered_node():
+                if node.kind == catalog.device_kind:
+                    return f"{node.name}: double-click to open its patch"
+                return catalog.doc(node.kind)
+        if self.patch():
+            return "Tab adds a node · drag a box to pick, Cmd-G groups · drag between sockets to wire · U goes up"
+        return "Tab adds an instrument or effect · drag between sockets to wire"
+
+    func hovered_node(self) -> GraphNode?:
+        if let graph = self.workspace.shown_graph():
+            return graph.find(self.hovered)
+        return none
+
+    func header_color(self, node: GraphNode) -> Color:
+        if node.kind == catalog.lane_kind:
+            if let track = self.track():
+                return theme.track_shade(track.color, 0.55)
+        if node.kind == catalog.device_kind:
+            return theme.grey(78.0)
+        if node.kind == catalog.output_kind:
+            return theme.grey(70.0)
+        if node.kind == catalog.group_kind:
+            return theme.srgb(92.0, 84.0, 64.0)
+        if node.kind == catalog.inlet_kind or node.kind == catalog.outlet_kind:
+            return theme.srgb(70.0, 76.0, 88.0)
+        return theme.grey(64.0)
+
+    func draw_node(self, p: Painter, graph: Graph, node: GraphNode, view_width: float, view_height: float) -> unit!:
+        let at = self.to_screen(node.x, node.y)
+        let w = node_width * self.zoom
+        let h = self.height_of(node) * self.zoom
+        if at.x + w < 0.0 or at.x > view_width or at.y + h < 0.0 or at.y > view_height:
+            return
+        let picked = node.id in self.workspace.nodes
+        let radius = 4.0 * self.zoom
+        let outline = 3.0 if node.kind == catalog.device_kind or node.kind == catalog.group_kind else 1.5
+        let edge = theme.accent() if picked else (theme.text_muted() if self.hovered == node.id else theme.grey(78.0))
+        p.rounded_rectangle(Rect(at.x - outline, at.y - outline, w + outline * 2.0, h + outline * 2.0), edge, radius + outline)
+        p.rounded_rectangle(Rect(at.x, at.y, w, h), theme.grey(56.0), radius)
+        p.rounded_rectangle(Rect(at.x, at.y, w, header * self.zoom), self.header_color(node), radius, corners = 3)
+        var title = node.name
+        if node.kind == catalog.device_kind:
+            title = f"{node.name}"
+        p.text(title, at.x + 8.0 * self.zoom, at.y + 4.0 * self.zoom, theme.text(), self.font)
+        if node.kind == catalog.device_kind and self.zoom >= 0.6:
+            let detail = f"{node.voices}v" if node.voices > 1 else "mono"
+            p.text(detail, at.x + w - 40.0 * self.zoom, at.y + 4.0 * self.zoom, theme.text_muted(), self.font)
+        for port in self.outputs_of(node):
+            let point = self.port_point(node, true, port.slot)
+            let label = port.name
+            p.text(label, point.x - (12.0 + 7.5 * float(label.length)) * self.zoom, point.y - 8.0 * self.zoom, theme.text_muted(), self.font)
+            self.draw_socket(p, point, port.kind, true)
+        for port in self.inputs_of(node):
+            let point = self.port_point(node, false, port.slot)
+            let wired = graph.wire_into(node.id, port.slot) != none
+            p.text(port.name, point.x + 11.0 * self.zoom, point.y - 8.0 * self.zoom, theme.text() if wired else theme.text_muted(), self.font)
+            self.draw_socket(p, point, port.kind, wired)
+
+    func draw_socket(self, p: Painter, at: Point, kind: int, filled: bool) -> unit!:
+        let r = math.max(3.0, 4.5 * self.zoom)
+        p.rounded_rectangle(Rect(at.x - r, at.y - r, 2.0 * r, 2.0 * r), theme.port_color(kind), r)
+        if not filled:
+            p.rounded_rectangle(Rect(at.x - r * 0.45, at.y - r * 0.45, r * 0.9, r * 0.9), theme.grey(56.0), r * 0.45)
+
+    pub func curve(self, a: Point, b: Point) -> list[Point]:
+        let reach = math.max(35.0, math.abs(b.x - a.x) * 0.5)
+        let points = [a]
+        for step in 1..<21:
+            let t = float(step) / 20.0
+            let u = 1.0 - t
+            points.append(Point(u * u * u * a.x + 3.0 * u * u * t * (a.x + reach) + 3.0 * u * t * t * (b.x - reach) + t * t * t * b.x,
+                                u * u * u * a.y + 3.0 * u * u * t * a.y + 3.0 * u * t * t * b.y + t * t * t * b.y))
+        return points
+
+    func draw_wire(self, p: Painter, a: Point, b: Point, color: Color, width: float) -> unit!:
+        let points = self.curve(a, b)
+        let thick = math.max(1.0, width * self.zoom)
+        for at in 1..<points.length:
+            p.line(points[at - 1], points[at], thick, color)
+
+    ## [node, port, 1 output / 0 input] under (x, y), or [].
+    func hit_port(self, x: float, y: float) -> list[int]:
+        let graph = self.workspace.shown_graph() else return []
+        for node in graph.nodes.reversed():
+            for port in self.outputs_of(node):
+                let point = self.port_point(node, true, port.slot)
+                if math.abs(point.x - x) <= 9.0 and math.abs(point.y - y) <= 8.0:
+                    return [node.id, port.slot, 1]
+            for port in self.inputs_of(node):
+                let point = self.port_point(node, false, port.slot)
+                if math.abs(point.x - x) <= 9.0 and math.abs(point.y - y) <= 8.0:
+                    return [node.id, port.slot, 0]
+        return []
+
+    func hit_wire(self, x: float, y: float) -> Wire?:
+        let graph = self.workspace.shown_graph() else return none
+        for wire in graph.wires:
+            if let source = graph.find(wire.source):
+                if let target_node = graph.find(wire.target):
+                    let points = self.curve(self.port_point(source, true, wire.output), self.port_point(target_node, false, wire.input))
+                    for at in 1..<points.length:
+                        if near_segment(points[at - 1], points[at], x, y, 5.0):
+                            return wire
+        return none
+
+    pub func event(self, event: Event) -> unit!:
+        if event.kind == EventKind.pointer_moved or event.kind == EventKind.pointer_down:
+            self.pointer_x = event.x
+            self.pointer_y = event.y
+        let w = self.workspace
+        if event.cancelled or event.kind == EventKind.focus_lost or event.kind == EventKind.overflow:
+            if self.mode == "move":
+                w.cancel()
+            self.mode = ""
+            self.space = false
+        elif event.kind == EventKind.key_down:
+            if event.key == Key.space:
+                self.space = true
+            elif event.key == Key.tab:
+                if let search = self.on_search:
+                    search()
+            elif event.key == Key.delete or event.key == Key.backspace:
+                if let wire = self.picked_wire:
+                    edits.cut_wire(w, wire)
+                    self.picked_wire = none
+                else:
+                    edits.delete_nodes(w)
+            elif event.key == Key.home or (event.key == Key.f and not event.meta):
+                self.frame_all()
+            elif event.key == Key.u and not event.meta:
+                w.up()
+            elif event.key == Key.escape:
+                if self.mode == "move":
+                    w.cancel()
+                self.mode = ""
+        elif event.kind == EventKind.key_up and event.key == Key.space:
+            self.space = false
+        elif event.kind == EventKind.magnify:
+            self.zoom_about(math.max(0.1, 1.0 + event.scroll_y), event.x, event.y)
+        elif event.kind == EventKind.scroll:
+            if event.scroll_unit == ScrollUnit.points and not event.control and not event.meta:
+                self.pan_x += event.scroll_x
+                self.pan_y += event.scroll_y
+            else:
+                self.zoom_about(math.exp(event.scroll_y * (0.01 if event.scroll_unit == ScrollUnit.points else 0.12)), event.x, event.y)
+        elif event.kind == EventKind.pointer_down and event.inside:
+            self.last_x = event.x
+            self.last_y = event.y
+            self.start_x = event.x
+            self.start_y = event.y
+            if event.button == 2 or self.space:
+                self.mode = "pan"
+            elif event.button == 0:
+                self.press(event)
+        elif event.kind == EventKind.pointer_moved:
+            self.hovered = -1
+            if event.inside:
+                if let node = self.node_at(event.x, event.y):
+                    self.hovered = node.id
+            if self.mode == "pan":
+                self.pan_x += event.x - self.last_x
+                self.pan_y += event.y - self.last_y
+            elif self.mode == "move":
+                if let graph = w.shown_graph():
+                    for (id, x, y) in self.moving:
+                        if let node = graph.find(id):
+                            node.x = x + (event.x - self.start_x) / self.zoom
+                            node.y = y + (event.y - self.start_y) / self.zoom
+                    w.revision += 1
+            self.last_x = event.x
+            self.last_y = event.y
+        elif event.kind == EventKind.pointer_up:
+            if self.mode == "move":
+                if event.x == self.start_x and event.y == self.start_y:
+                    w.cancel()
+                else:
+                    w.commit()
+            elif self.mode == "box":
+                self.finish_box(event)
+            elif self.mode == "wire":
+                let port = self.hit_port(event.x, event.y)
+                if port.length > 0 and port[0] == self.wire_node and (port[2] == 1) == self.from_output:
+                    # A click on a socket starts a wire that follows the pointer.
+                    self.box.invalidate()
+                    return
+                self.finish_wire(port)
+            self.mode = ""
+        elif event.kind == EventKind.pointer_left:
+            self.hovered = -1
+        self.box.invalidate()
+
+    func press(self, event: Event) -> unit!:
+        let w = self.workspace
+        if self.mode == "wire":
+            self.finish_wire(self.hit_port(event.x, event.y))
+            self.mode = ""
+            return
+        let port = self.hit_port(event.x, event.y)
+        if port.length > 0:
+            if event.alt and port[2] == 0:
+                edits.disconnect(w, port[0], port[1])
+                return
+            self.mode = "wire"
+            self.wire_node = port[0]
+            self.wire_port = port[1]
+            self.from_output = port[2] == 1
+            return
+        if let node = self.node_at(event.x, event.y):
+            self.picked_wire = none
+            if event.shift:
+                w.toggle_node(node.id)
+                return
+            if node.id in w.nodes:
+                w.node = node.id
+                w.focus = 3
+                w.revision += 1
+            else:
+                w.select_node(node.id)
+            let now = time.now()
+            if self.last_node == node.id and now - self.last_click < 400000000:
+                self.last_node = -1
+                if node.kind == catalog.device_kind and not self.patch():
+                    w.enter(node.id)
+                    return
+                if node.kind == catalog.group_kind:
+                    w.enter_group(node.id)
+                    return
+            self.last_node = node.id
+            self.last_click = now
+            self.mode = "move"
+            self.moving = []
+            if let graph = w.shown_graph():
+                for id in w.nodes:
+                    if let picked = graph.find(id):
+                        self.moving.append((id, picked.x, picked.y))
+            w.begin("Move nodes")
+            return
+        self.picked_wire = self.hit_wire(event.x, event.y)
+        if self.picked_wire == none:
+            # Empty canvas: a box picks the nodes it touches (Shift adds).
+            if not event.shift:
+                w.select_node(-1)
+            self.mode = "box"
+
+    ## Pick the nodes the box from the press to `event` touches.
+    func finish_box(self, event: Event):
+        let w = self.workspace
+        let graph = w.shown_graph() else return
+        let a = self.to_graph(math.min(self.start_x, event.x), math.min(self.start_y, event.y))
+        let b = self.to_graph(math.max(self.start_x, event.x), math.max(self.start_y, event.y))
+        if b.x - a.x < 3.0 / self.zoom and b.y - a.y < 3.0 / self.zoom:
+            return
+        for node in graph.nodes:
+            if node.x <= b.x and node.x + node_width >= a.x and node.y <= b.y and node.y + self.height_of(node) >= a.y:
+                if not (node.id in w.nodes):
+                    w.nodes.append(node.id)
+                    w.node = node.id
+        w.focus = 3
+        w.revision += 1
+
+    func finish_wire(self, port: list[int]) -> unit!:
+        if port.length == 0 or (port[2] == 1) == self.from_output:
+            return
+        if self.from_output:
+            edits.connect(self.workspace, self.wire_node, self.wire_port, port[0], port[1])
+        else:
+            edits.connect(self.workspace, port[0], port[1], self.wire_node, self.wire_port)
+
+## Where the node menu puts a new node: under the pointer, in graph units.
+pub func place(view: GraphView) -> Point:
+    return view.to_graph(view.pointer_x, view.pointer_y)
+
+func near_segment(a: Point, b: Point, x: float, y: float, reach: float) -> bool:
+    let dx = b.x - a.x
+    let dy = b.y - a.y
+    let t = math.clamp(((x - a.x) * dx + (y - a.y) * dy) / math.max(1e-9, dx * dx + dy * dy), 0.0, 1.0)
+    return math.hypot(x - a.x - t * dx, y - a.y - t * dy) <= reach

@@ -1,0 +1,16 @@
+#prisma 4.0
+def package "luced-music-bounce" {
+    str owner = "dymokomi"
+    str version = "0.0.1"
+    str kind = "tool"
+    str language = "luce"
+    str entry = "main.luc"
+    def dependency "luced-music" {
+        str owner = "dymokomi"
+        str path = "../.."
+    }
+    def dependency "luce-std" {
+        str owner = "dymokomi"
+        str path = "../../../luce-std"
+    }
+}

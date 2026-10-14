@@ -1,0 +1,166 @@
+## The node kinds. A patch's are the engine's own, read from luce-audio's
+## table (its names, ports and parameters), so a kind added there is offered
+## here; a rack has three of its own: a lane's notes or curve, a device
+## (an instrument or effect, holding a patch), and the track's output.
+from luce_audio import engine
+
+pub let lane_kind: int = 1000
+pub let device_kind: int = 1001
+pub let output_kind: int = 1002
+## A patch's group of nodes, and the Inlet and Outlet nodes inside one that
+## are its sockets.
+pub let group_kind: int = 1003
+pub let inlet_kind: int = 1004
+pub let outlet_kind: int = 1005
+
+## What a port carries, and so what may be wired to it.
+pub let signal: int = 0
+pub let notes: int = 1
+pub let audio: int = 2
+pub let control: int = 3
+
+## A device's inputs: notes, audio, then its eight controls.
+pub let device_notes: int = 0
+pub let device_audio: int = 1
+pub let device_control: int = 2
+
+## The track output's inputs.
+pub let output_audio: int = 0
+pub let output_volume: int = 1
+pub let output_pan: int = 2
+
+pub struct Port:
+    pub var name: str
+    pub var kind: int
+    ## The index a wire names it by (a device hides ports its patch lacks).
+    pub var slot: int
+
+pub struct ParamInfo:
+    pub var name: str
+    pub var minimum: float
+    pub var maximum: float
+    pub var initial: float
+    pub var units: str
+    pub var items: str
+    pub var logarithmic: bool
+
+pub func is_patch(kind: int) -> bool:
+    return kind >= 0 and kind < engine.kind_count()
+
+## Whether a node of `kind` may sit in a patch: the engine's, or a group's.
+pub func in_patch(kind: int) -> bool:
+    return is_patch(kind) or kind == group_kind or kind == inlet_kind or kind == outlet_kind
+
+pub func patch_kinds() -> list[int]:
+    let kinds: list[int] = []
+    for kind in 0..<engine.kind_count():
+        kinds.append(kind)
+    return kinds
+
+pub func kind_name(kind: int) -> str:
+    if kind == lane_kind:
+        return "Lane"
+    if kind == device_kind:
+        return "Device"
+    if kind == output_kind:
+        return "Track Out"
+    if kind == group_kind:
+        return "Group"
+    if kind == inlet_kind:
+        return "Inlet"
+    if kind == outlet_kind:
+        return "Outlet"
+    return engine.kind_name(kind)
+
+pub func category(kind: int) -> str:
+    if is_patch(kind):
+        return engine.kind_category(kind)
+    if kind == group_kind or kind == inlet_kind or kind == outlet_kind:
+        return "Groups"
+    return "Rack"
+
+pub func doc(kind: int) -> str:
+    if kind == lane_kind:
+        return "A lane's clips: notes to play an instrument, or a curve to move a control."
+    if kind == device_kind:
+        return "An instrument or effect: a patch of nodes. Double-click to open it."
+    if kind == output_kind:
+        return "What the track plays, at its volume and pan."
+    if kind == group_kind:
+        return "Nodes collapsed into one: double-click to enter; its Inlets and Outlets are its sockets."
+    if kind == inlet_kind:
+        return "A socket of the group it is in: what is wired to the group's input comes out here."
+    if kind == outlet_kind:
+        return "A socket of the group it is in: what is wired here comes out of the group."
+    return engine.kind_doc(kind)
+
+## The kind named `name`, or -1.
+pub func named(name: str) -> int:
+    for kind in 0..<engine.kind_count():
+        if engine.kind_name(kind) == name:
+            return kind
+    return -1
+
+func ports_of(names: str, kind: int) -> list[Port]:
+    let ports: list[Port] = []
+    if names == "":
+        return ports
+    for name in names.split(","):
+        ports.append(Port(name = name, kind = kind, slot = ports.length))
+    return ports
+
+## A patch kind's inputs and outputs.
+pub func inputs(kind: int) -> list[Port]:
+    if is_patch(kind):
+        return ports_of(engine.kind_inputs(kind), signal)
+    return []
+
+pub func outputs(kind: int) -> list[Port]:
+    if is_patch(kind):
+        return ports_of(engine.kind_outputs(kind), signal)
+    return []
+
+pub func params(kind: int) -> list[ParamInfo]:
+    let infos: list[ParamInfo] = []
+    if not is_patch(kind):
+        return infos
+    for at in 0..<engine.param_count(kind):
+        infos.append(ParamInfo(name = engine.param_name(kind, at), minimum = engine.param_minimum(kind, at), maximum = engine.param_maximum(kind, at),
+                               initial = engine.param_default(kind, at), units = engine.param_units(kind, at), items = engine.param_items(kind, at),
+                               logarithmic = engine.param_logarithmic(kind, at)))
+    return infos
+
+pub func defaults(kind: int) -> list[float]:
+    let values: list[float] = []
+    for info in params(kind):
+        values.append(info.initial)
+    return values
+
+## The engine kinds' categories in the order a menu shows them.
+pub func categories() -> list[str]:
+    return ["Inputs", "Sources", "Filters", "Modulation", "Effects", "Utilities"]
+
+# ------------------------------------------------ scales
+
+## The scale modes and roots the engine knows, as menu items.
+pub func scale_modes() -> str:
+    return engine.scale_modes()
+
+pub func scale_roots() -> str:
+    return engine.scale_roots()
+
+## A key's name: "E♭ Minor".
+pub func key_name(root: int, mode: int) -> str:
+    let roots = engine.scale_roots().split("|")
+    let modes = engine.scale_modes().split("|")
+    let root_name = roots[root] if root >= 0 and root < roots.length else "?"
+    let mode_name = modes[mode] if mode >= 0 and mode < modes.length else "?"
+    return f"{root_name} {mode_name}"
+
+## Whether `note` belongs to mode `mode` on `root`.
+pub func in_scale(note: int, root: int, mode: int) -> bool:
+    return engine.in_scale(note, root, mode)
+
+## The note mode `mode` on `root` plays for `note`.
+pub func quantize_note(note: int, root: int, mode: int) -> int:
+    return engine.quantize_note(note, root, mode)

@@ -1,0 +1,24 @@
+## How much faster than realtime the engine renders each demo song: the
+## share of one core a second of it takes.
+import presets
+import songs
+from bridge import Bridge
+import time
+
+pub func main(arguments: list[str]) -> int!:
+    for (name, song) in songs.all_songs():
+        let bridge = Bridge(48000.0)
+        bridge.publish(song)
+        let engine = bridge.engine
+        engine.play()
+        engine.render(4800)
+        let seconds = 16
+        let started = time.now()
+        var voices = 0
+        for _ in 0..<seconds * 10:
+            engine.render(4800)
+            voices = voices if voices > engine.sounding_voices() else engine.sounding_voices()
+        let elapsed = float(time.now() - started) / 1000000000.0
+        print(f"{name}: {float(seconds) / elapsed:.0f}x realtime, {elapsed / float(seconds) * 100.0:.2f}% of one core, up to {voices} voices")
+        bridge.close()
+    return 0

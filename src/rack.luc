@@ -1,0 +1,87 @@
+## The ports a node shows in its graph, and what may be wired. A patch
+## node's are its kind's; a rack's lane gives notes or a curve's value, a
+## device takes notes, audio and the controls its patch reads (a Control In
+## node each), and the track's output takes audio, a volume and a pan.
+## A device's inputs keep their index whatever its patch shows: notes 0,
+## audio 1, control k at 1 + k, so a wire stays right as the patch changes.
+from song import Track, Graph, GraphNode
+import catalog
+from catalog import Port
+
+## The highest Control In index `patch` reads (1..8), or 0.
+pub func controls_read(patch: Graph?) -> int:
+    var most = 0
+    if let inner = patch:
+        let control = catalog.named("Control In")
+        for node in inner.nodes:
+            if node.kind == control and node.params.length > 0:
+                let index = int(node.params[0])
+                if index > most:
+                    most = index
+            elif node.kind == catalog.group_kind:
+                let deeper = controls_read(node.patch)
+                if deeper > most:
+                    most = deeper
+    return most
+
+## Whether `patch` has a node of kind `name`.
+pub func has_kind(patch: Graph?, name: str) -> bool:
+    let kind = catalog.named(name)
+    if let inner = patch:
+        for node in inner.nodes:
+            if node.kind == kind:
+                return true
+            if node.kind == catalog.group_kind and has_kind(node.patch, name):
+                return true
+    return false
+
+pub func inputs(track: Track?, node: GraphNode) -> list[Port]:
+    if node.kind == catalog.device_kind:
+        let ports: list[Port] = []
+        let played = has_kind(node.patch, "Note In")
+        let hears = has_kind(node.patch, "Audio In")
+        if played or not hears:
+            ports.append(Port(name = "notes", kind = catalog.notes, slot = catalog.device_notes))
+        if hears:
+            ports.append(Port(name = "audio", kind = catalog.audio, slot = catalog.device_audio))
+        for k in 1..=controls_read(node.patch):
+            ports.append(Port(name = f"control {k}", kind = catalog.control, slot = catalog.device_control + k - 1))
+        return ports
+    if node.kind == catalog.output_kind:
+        return [Port(name = "audio", kind = catalog.audio, slot = 0), Port(name = "volume", kind = catalog.control, slot = 1), Port(name = "pan", kind = catalog.control, slot = 2)]
+    if node.kind == catalog.lane_kind:
+        return []
+    return catalog.inputs(node.kind)
+
+pub func outputs(track: Track?, node: GraphNode) -> list[Port]:
+    if node.kind == catalog.device_kind:
+        return [Port(name = "audio", kind = catalog.audio, slot = 0)]
+    if node.kind == catalog.output_kind:
+        return []
+    if node.kind == catalog.lane_kind:
+        if let owner = track:
+            if let lane = owner.lane(node.lane):
+                if lane.curve:
+                    return [Port(name = "value", kind = catalog.control, slot = 0)]
+        return [Port(name = "notes", kind = catalog.notes, slot = 0)]
+    return catalog.outputs(node.kind)
+
+## Whether output `output` of `source` may feed input `input` of `target`.
+pub func fits(track: Track?, source: GraphNode, output: int, target: GraphNode, input: int) -> bool:
+    if source.id == target.id:
+        return false
+    let out = port_at(outputs(track, source), output) else return false
+    let into = port_at(inputs(track, target), input) else return false
+    return out.kind == into.kind
+
+## The port with slot `slot`.
+pub func port_at(ports: list[Port], slot: int) -> Port?:
+    for port in ports:
+        if port.slot == slot:
+            return port
+    return none
+
+## Whether an input sums every wire into it (a device's or the output's
+## audio) rather than taking one.
+pub func sums(target: GraphNode, input: int) -> bool:
+    return (target.kind == catalog.device_kind and input == catalog.device_audio) or (target.kind == catalog.output_kind and input == catalog.output_audio) or (target.kind == catalog.device_kind and input == catalog.device_notes)

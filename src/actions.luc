@@ -1,0 +1,249 @@
+## The editor's commands, shared by menus, buttons and shortcuts; what each
+## does lives where its state does (edits.luc, the views, the panels).
+from luce_ui.ui import Command, Shortcut
+from luce_window.input import Key
+from interop import Connection
+from workspace import Workspace
+import edits
+import presets
+import catalog
+import library
+from recorder import Recorder
+
+pub class Actions:
+    pub let new_song: Command
+    pub let open_song: Command
+    pub let save: Command
+    pub let save_as: Command
+    pub let undo: Command
+    pub let redo: Command
+    pub let play: Command
+    pub let stop: Command
+    pub let to_start: Command
+    pub let loop: Command
+    pub let record: Command
+    pub let metronome: Command
+    pub let arm: Command
+    ## The take being recorded.
+    pub let recorder: Recorder
+    pub let audio: Command
+    pub let panic: Command
+    pub let add_track: Command
+    pub let delete_track: Command
+    pub let add_notes_lane: Command
+    pub let add_curve_lane: Command
+    pub let delete_lane: Command
+    pub let delete_clips: Command
+    pub let duplicate_clips: Command
+    pub let add_node: Command
+    pub let up: Command
+    pub let frame_nodes: Command
+    pub let reset_layout: Command
+    pub let collapse: Command
+    pub let expand: Command
+    pub let save_preset: Command
+    pub let grids: list[Command]
+    ## The node menu's entries: in a rack, the instruments and effects; in a
+    ## patch, the engine's kinds. `adding` says which one was chosen.
+    pub let rack_entries: list[Command]
+    pub let patch_entries: list[Command]
+    pub var on_add_device: func(str) -> unit!? = none
+    pub var on_add_node: func(int) -> unit!? = none
+    ## A saved preset chosen: its shelf and name.
+    pub var on_add_preset: func(str, str) -> unit!? = none
+    ## The user's presets as node menu entries, rebuilt as they are saved.
+    pub var user_rack: list[Command]
+    pub var user_patch: list[Command]
+    var preset_connections: list[Connection]
+    let connections: list[Connection]
+    let workspace: Workspace
+
+    pub func init(self, workspace: Workspace) -> unit!:
+        self.workspace = workspace
+        self.connections = []
+        self.new_song = Command("New song", Shortcut(Key.n, primary = true), id = "new_song")
+        self.open_song = Command("Open…", Shortcut(Key.o, primary = true), id = "open_song")
+        self.save = Command("Save", Shortcut(Key.s, primary = true), id = "save_song")
+        self.save_as = Command("Save As…", Shortcut(Key.s, primary = true, shift = true), id = "save_song_as")
+        self.undo = Command("Undo", Shortcut(Key.z, primary = true), id = "undo", icon = "undo")
+        self.redo = Command("Redo", Shortcut(Key.z, primary = true, shift = true), id = "redo", icon = "redo")
+        self.play = Command("Play / Stop", Shortcut(Key.space), id = "play", icon = "play")
+        self.stop = Command("Stop and return", Shortcut(Key.enter), id = "stop", icon = "stop")
+        self.to_start = Command("Go to start", Shortcut(Key.home), id = "to_start", icon = "go-to-start")
+        self.loop = Command("Loop", Shortcut(Key.l), id = "loop", icon = "loop-region")
+        self.record = Command("Record", Shortcut(Key.r), id = "record", icon = "record")
+        self.metronome = Command("Metronome", Shortcut(Key.c), id = "metronome", icon = "metronome")
+        self.arm = Command("Arm track for recording", Shortcut(Key.r, shift = true), id = "arm_track")
+        self.recorder = Recorder()
+        self.audio = Command("Audio output", Shortcut(Key.a, primary = true, shift = true), id = "audio", icon = "audio-output")
+        self.panic = Command("Silence everything", Shortcut(Key.period, primary = true), id = "panic")
+        self.add_track = Command("Add track", Shortcut(Key.t, primary = true), id = "add_track", icon = "track-add")
+        self.delete_track = Command("Delete track", id = "delete_track")
+        self.add_notes_lane = Command("Add notes lane", Shortcut(Key.l, primary = true, shift = true), id = "add_notes_lane", icon = "note-lane")
+        self.add_curve_lane = Command("Add curve lane", Shortcut(Key.k, primary = true, shift = true), id = "add_curve_lane", icon = "automation-curve")
+        self.delete_lane = Command("Delete lane", id = "delete_lane")
+        self.delete_clips = Command("Delete clips", id = "delete_clips", icon = "trash")
+        self.duplicate_clips = Command("Duplicate clips", Shortcut(Key.d, primary = true), id = "duplicate_clips", icon = "duplicate")
+        self.add_node = Command("Add node…", id = "add_node", icon = "add-node")
+        self.up = Command("Up one level", Shortcut(Key.u), id = "up", icon = "arrow-up")
+        self.frame_nodes = Command("Frame nodes", id = "frame_nodes", icon = "frame-selection")
+        self.reset_layout = Command("Reset panel layout", id = "reset_layout")
+        self.collapse = Command("Group nodes", Shortcut(Key.g, primary = true), id = "group_nodes", icon = "group-nodes")
+        self.expand = Command("Ungroup", Shortcut(Key.g, primary = true, shift = true), id = "ungroup_nodes")
+        self.save_preset = Command("Save as preset…", Shortcut(Key.p, primary = true, shift = true), id = "save_preset", icon = "save")
+        self.user_rack = []
+        self.user_patch = []
+        self.preset_connections = []
+        self.grids = []
+        for (label, beats) in [("Grid: bar", 4.0), ("Grid: 1/4", 1.0), ("Grid: 1/8", 0.5), ("Grid: 1/16", 0.25), ("Grid: 1/32", 0.125), ("Grid: off", 0.0)]:
+            let command = Command(label, id = "grid_" + label)
+            self.connections.append(command.on_trigger(func () -> unit!:
+                workspace.grid = beats
+                self.refresh()))
+            self.grids.append(command)
+        self.rack_entries = []
+        for name in presets.instrument_names():
+            let command = Command("Instrument: " + name, id = "add_" + name)
+            self.connections.append(command.on_trigger(func () -> unit!:
+                if let add = self.on_add_device:
+                    add(name)))
+            self.rack_entries.append(command)
+        for name in presets.effect_names():
+            let command = Command("Effect: " + name, id = "add_" + name)
+            self.connections.append(command.on_trigger(func () -> unit!:
+                if let add = self.on_add_device:
+                    add(name)))
+            self.rack_entries.append(command)
+        self.patch_entries = []
+        for kind in catalog.patch_kinds() + [catalog.group_kind, catalog.inlet_kind, catalog.outlet_kind]:
+            let command = Command(catalog.category(kind) + ": " + catalog.kind_name(kind), id = f"add_kind_{kind}")
+            self.connections.append(command.on_trigger(func () -> unit!:
+                if let add = self.on_add_node:
+                    add(kind)))
+            self.patch_entries.append(command)
+        self.connections.append(self.undo.on_trigger(func () -> unit!: workspace.undo()))
+        self.connections.append(self.redo.on_trigger(func () -> unit!: workspace.redo()))
+        self.connections.append(self.add_track.on_trigger(func () -> unit!: edits.add_track(workspace)))
+        self.connections.append(self.delete_track.on_trigger(func () -> unit!: edits.delete_track(workspace)))
+        self.connections.append(self.add_notes_lane.on_trigger(func () -> unit!: edits.add_lane(workspace, false)))
+        self.connections.append(self.add_curve_lane.on_trigger(func () -> unit!: edits.add_lane(workspace, true)))
+        self.connections.append(self.delete_lane.on_trigger(func () -> unit!: edits.delete_lane(workspace)))
+        self.connections.append(self.delete_clips.on_trigger(func () -> unit!: edits.delete_clips(workspace)))
+        self.connections.append(self.duplicate_clips.on_trigger(func () -> unit!: edits.duplicate_clips(workspace)))
+        self.connections.append(self.up.on_trigger(func () -> unit!: workspace.up()))
+        self.connections.append(self.play.on_trigger(func () -> unit!:
+            let engine = workspace.bridge.engine
+            workspace.bridge.refresh(workspace.song)
+            if workspace.playing:
+                engine.stop()
+                workspace.playing = false
+                self.recorder.finish(workspace)
+            else:
+                engine.play()
+                workspace.playing = true
+            self.refresh()))
+        self.connections.append(self.record.on_trigger(func () -> unit!:
+            workspace.bridge.refresh(workspace.song)
+            if self.recorder.on:
+                self.recorder.finish(workspace)
+            else:
+                self.recorder.begin(workspace)
+            self.refresh()))
+        self.connections.append(self.metronome.on_trigger(func () -> unit!:
+            workspace.metronome = not workspace.metronome
+            workspace.bridge.engine.set_metronome(workspace.metronome, workspace.song.beats_per_bar)
+            self.refresh()))
+        self.connections.append(self.arm.on_trigger(func () -> unit!:
+            if let track = workspace.selected_track():
+                edits.toggle_arm(workspace, track)
+            self.refresh()))
+        self.connections.append(self.stop.on_trigger(func () -> unit!:
+            workspace.bridge.engine.stop()
+            self.recorder.finish(workspace)
+            workspace.bridge.engine.seek(workspace.song.loop_start if workspace.song.loop_on else 0.0)
+            workspace.playing = false
+            self.refresh()))
+        self.connections.append(self.to_start.on_trigger(func () -> unit!:
+            workspace.bridge.engine.seek(0.0)
+            workspace.playhead = 0.0
+            workspace.revision += 1))
+        self.connections.append(self.loop.on_trigger(func () -> unit!:
+            workspace.song.loop_on = not workspace.song.loop_on
+            workspace.bridge.engine.set_loop(workspace.song.loop_on, workspace.song.loop_start, workspace.song.loop_end)
+            workspace.changed(live = true)
+            self.refresh()))
+        self.connections.append(self.panic.on_trigger(func () -> unit!: workspace.bridge.engine.panic()))
+        self.connections.append(self.collapse.on_trigger(func () -> unit!: edits.collapse(workspace)))
+        self.connections.append(self.expand.on_trigger(func () -> unit!: edits.expand(workspace)))
+        self.load_presets()
+        self.refresh()
+
+    ## Read the user's presets again into the node menus' entries.
+    pub func load_presets(self) -> unit!:
+        for connection in self.preset_connections:
+            connection.disconnect()
+        self.preset_connections = []
+        self.user_rack = []
+        self.user_patch = []
+        for name in library.names(library.instruments):
+            let command = Command("My instrument: " + name, id = "user_instrument_" + name)
+            self.preset_connections.append(command.on_trigger(func () -> unit!:
+                if let add = self.on_add_preset:
+                    add(library.instruments, name)))
+            self.user_rack.append(command)
+        for name in library.names(library.modules):
+            let command = Command("My module: " + name, id = "user_module_" + name)
+            self.preset_connections.append(command.on_trigger(func () -> unit!:
+                if let add = self.on_add_preset:
+                    add(library.modules, name)))
+            self.user_patch.append(command)
+        # An instrument may be placed inside a patch too: its patch as a group.
+        for name in library.names(library.instruments):
+            let command = Command("My instrument as a group: " + name, id = "user_instrument_group_" + name)
+            self.preset_connections.append(command.on_trigger(func () -> unit!:
+                if let add = self.on_add_preset:
+                    add("instrument-group", name)))
+            self.user_patch.append(command)
+
+    ## Every command, for the window's shortcuts.
+    pub func all(self) -> list[Command]:
+        let commands = [self.new_song, self.open_song, self.save, self.save_as, self.undo, self.redo, self.play, self.stop, self.to_start, self.loop,
+                        self.record, self.metronome, self.arm,
+                        self.audio, self.panic, self.add_track, self.delete_track, self.add_notes_lane, self.add_curve_lane, self.delete_lane,
+                        self.delete_clips, self.duplicate_clips, self.add_node, self.up, self.frame_nodes, self.reset_layout,
+                        self.collapse, self.expand, self.save_preset]
+        return commands + self.grids
+
+    ## Enabled states and ticks from the workspace.
+    pub func refresh(self) -> unit!:
+        let w = self.workspace
+        self.undo.set_enabled(w.can_undo())
+        self.redo.set_enabled(w.can_redo())
+        self.loop.set_checked(w.song.loop_on)
+        self.record.set_checked(self.recorder.on)
+        self.metronome.set_checked(w.metronome)
+        var armed = false
+        if let track = w.selected_track():
+            armed = track.armed
+        self.arm.set_checked(armed)
+        self.audio.set_checked(w.bridge.engine.output_running())
+        self.up.set_enabled(w.showing_patch())
+        self.collapse.set_enabled(w.showing_patch() and w.nodes.length > 0)
+        var group_picked = false
+        if let node = w.selected_node():
+            group_picked = node.kind == catalog.group_kind
+        self.expand.set_enabled(group_picked)
+        self.delete_track.set_enabled(w.selected_track() != none)
+        self.delete_lane.set_enabled(w.selected_lane() != none)
+        self.delete_clips.set_enabled(w.clips.length > 0)
+        self.duplicate_clips.set_enabled(w.clips.length > 0)
+        self.play.set_icon("pause" if w.playing else "play")
+        let beats = [4.0, 1.0, 0.5, 0.25, 0.125, 0.0]
+        for at in 0..<self.grids.length:
+            self.grids[at].set_checked(beats[at] == w.grid)
+
+    pub func close(self):
+        for connection in self.connections:
+            connection.disconnect()
+        for connection in self.preset_connections:
+            connection.disconnect()

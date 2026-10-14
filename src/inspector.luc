@@ -1,0 +1,403 @@
+## The Parameters panel: one ParameterPanel showing what was clicked last:
+## a patch node's parameters (the engine's ranges and menus), a device's
+## name and voices, a track's mix, a lane, a clip, the picked notes, or with
+## nothing picked the song (tempo, meter). A knob's drag is one undo step and
+## reaches the engine as it moves.
+from luce_ui.ui import VStack, Text, Font, ParameterPanel, ParameterSpec, ParameterKind
+from interop import Connection
+from workspace import Workspace
+import workspace as ws
+import catalog
+import edits
+import groups
+from song import GraphNode
+
+## A row: what it edits (a role) and, for a node's parameter, its slot.
+struct Row:
+    var role: str
+    var slot: int
+    ## The node a parameter row edits (-1: the picked node).
+    var node: int = -1
+
+pub class Inspector:
+    pub let body: VStack
+    let workspace: Workspace
+    let title: Text
+    let panel: ParameterPanel
+    var rows: list[Row]
+    var shown: str = ""
+    let connections: list[Connection]
+
+    pub func init(self, workspace: Workspace, font: Font) -> unit!:
+        self.workspace = workspace
+        self.rows = []
+        self.connections = []
+        self.title = Text("", font = font)
+        self.panel = ParameterPanel([], font = font)
+        self.body = VStack([self.title, self.panel], spacing = 4.0, padding = 6.0)
+        self.connections.append(self.panel.on_begin(func (index: int) -> unit!:
+            self.workspace.begin("Change " + self.label_of(index))))
+        self.connections.append(self.panel.on_change(self.changed))
+        self.connections.append(self.panel.on_commit(func (index: int) -> unit!:
+            self.workspace.commit()))
+
+    pub func close(self):
+        for connection in self.connections:
+            connection.disconnect()
+
+    func label_of(self, index: int) -> str:
+        if index >= 0 and index < self.rows.length:
+            return self.rows[index].role
+        return "value"
+
+    ## What is shown, as a key: rebuild the rows only when it changes.
+    func subject(self) -> str:
+        let w = self.workspace
+        if w.focus == ws.focus_node:
+            if let node = w.selected_node():
+                return f"node {w.device} {w.groups} {node.id}"
+        if w.focus == ws.focus_notes:
+            if let found15 = w.edited_clip():
+                let (_, lane, clip) = found15
+                if w.picked.length > 0 and not lane.curve:
+                    return f"notes {clip.id} {w.picked.length} {w.picked[0]}"
+        if w.focus == ws.focus_clip or w.focus == ws.focus_notes:
+            if let found16 = w.edited_clip():
+                let (_, _, clip) = found16
+                return f"clip {clip.id}"
+        if w.focus == ws.focus_key and w.selected_key() != none:
+            return f"key {w.key_row} {w.key}"
+        if w.focus == ws.focus_lane:
+            if let lane = w.selected_lane():
+                return f"lane {lane.id}"
+        if let track = w.selected_track():
+            return f"track {track.id}"
+        return "song"
+
+    ## MIDI sources came or went: rebuild the rows that list them.
+    pub func sources_changed(self):
+        self.shown = ""
+
+    ## The MIDI inputs as menu items: none, every one, then each source.
+    func midi_items(self) -> str!:
+        let engine = self.workspace.bridge.engine
+        let items = ["None=-1", "All inputs=0"]
+        for at in 0..<engine.midi_refresh():
+            let name = engine.midi_source_name(at).replace("|", "/").replace("=", "-")
+            items.append(f"{name}={engine.midi_source_id(at)}")
+        return items.join("|")
+
+    ## Rebuild or refresh the panel for the workspace's selection.
+    pub func refresh(self) -> unit!:
+        let key = self.subject()
+        if key != self.shown:
+            self.shown = key
+            self.build(key)
+        self.fill()
+
+    func build(self, key: str) -> unit!:
+        let w = self.workspace
+        let specs: list[ParameterSpec] = []
+        self.rows = []
+        if key.starts_with("node"):
+            let node = w.selected_node() else return
+            self.title.set_text(node.name + "  ·  " + catalog.kind_name(node.kind))
+            if catalog.is_patch(node.kind):
+                self.add(specs, "name", -1, ParameterSpec(name = "name", label = "Name", kind = ParameterKind.text, text = node.name))
+                let infos = catalog.params(node.kind)
+                for slot in 0..<infos.length:
+                    self.add_param(specs, node, slot, infos[slot])
+                self.add(specs, "info", -1, ParameterSpec(name = "doc", label = " ", kind = ParameterKind.info, text = catalog.doc(node.kind)))
+            elif node.kind == catalog.group_kind:
+                self.add(specs, "name", -1, ParameterSpec(name = "name", label = "Name", kind = ParameterKind.text, text = node.name))
+                self.add(specs, "info", -1, ParameterSpec(name = "doc", label = " ", kind = ParameterKind.info, text = "Double-click to enter; Cmd-Shift-P saves it as a module."))
+                if let inner = node.patch:
+                    for member in groups.flatten(inner).nodes:
+                        let infos = catalog.params(member.kind)
+                        if infos.length == 0:
+                            continue
+                        self.add(specs, "folder", -1, ParameterSpec(name = f"f{member.id}", label = member.name, kind = ParameterKind.folder))
+                        for slot in 0..<infos.length:
+                            self.add_param(specs, member, slot, infos[slot])
+            elif node.kind == catalog.inlet_kind or node.kind == catalog.outlet_kind:
+                self.add(specs, "name", -1, ParameterSpec(name = "name", label = "Socket name", kind = ParameterKind.text, text = node.name))
+                self.add(specs, "info", -1, ParameterSpec(name = "doc", label = " ", kind = ParameterKind.info, text = catalog.doc(node.kind)))
+            elif node.kind == catalog.device_kind:
+                self.add(specs, "name", -1, ParameterSpec(name = "name", label = "Name", kind = ParameterKind.text, text = node.name))
+                self.add(specs, "voices", -1, ParameterSpec(name = "voices", label = "Voices", kind = ParameterKind.integer, value = 8.0, minimum = 1.0, maximum = 32.0, slider = true))
+                self.add(specs, "info", -1, ParameterSpec(name = "doc", label = " ", kind = ParameterKind.info, text = "Double-click the device to open its patch; U goes back."))
+            else:
+                self.add(specs, "info", -1, ParameterSpec(name = "doc", label = " ", kind = ParameterKind.info, text = catalog.doc(node.kind)))
+        elif key.starts_with("notes"):
+            self.title.set_text("Notes")
+            self.add(specs, "velocity", -1, ParameterSpec(name = "velocity", label = "Velocity", value = 0.8, minimum = 0.0, maximum = 1.0, decimals = 2, slider = true))
+            if w.picked.length == 1:
+                self.add(specs, "pitch", -1, ParameterSpec(name = "pitch", label = "Pitch", kind = ParameterKind.integer, value = 60.0, minimum = 0.0, maximum = 127.0))
+                self.add(specs, "note_start", -1, ParameterSpec(name = "start", label = "Start", value = 0.0, minimum = 0.0, maximum = 4096.0, decimals = 3, suffix = " beats"))
+                self.add(specs, "note_length", -1, ParameterSpec(name = "length", label = "Length", value = 1.0, minimum = 0.01, maximum = 4096.0, decimals = 3, suffix = " beats"))
+        elif key.starts_with("clip"):
+            let found17 = w.edited_clip() else return
+            let (_, lane, clip) = found17
+            self.title.set_text("Clip")
+            self.add(specs, "clip_name", -1, ParameterSpec(name = "name", label = "Name", kind = ParameterKind.text, text = clip.name))
+            self.add(specs, "start", -1, ParameterSpec(name = "start", label = "Start", value = 0.0, minimum = 0.0, maximum = 100000.0, decimals = 2, suffix = " beats", step = 1.0))
+            self.add(specs, "length", -1, ParameterSpec(name = "length", label = "Length", value = 4.0, minimum = 0.25, maximum = 100000.0, decimals = 2, suffix = " beats", step = 1.0))
+            self.add(specs, "loop", -1, ParameterSpec(name = "loop", label = "Loop every", value = 4.0, minimum = 0.25, maximum = 100000.0, decimals = 2, suffix = " beats", step = 1.0))
+            if not lane.curve:
+                self.add(specs, "clip_pan", -1, ParameterSpec(name = "pan", label = "Pan", value = 0.0, minimum = -1.0, maximum = 1.0, decimals = 2, slider = true))
+        elif key.starts_with("lane"):
+            let lane = w.selected_lane() else return
+            self.title.set_text("Lane")
+            self.add(specs, "lane_name", -1, ParameterSpec(name = "name", label = "Name", kind = ParameterKind.text, text = lane.name))
+            if lane.curve:
+                self.add(specs, "low", -1, ParameterSpec(name = "low", label = "Bottom", value = 0.0, minimum = -100.0, maximum = 100.0, decimals = 2))
+                self.add(specs, "high", -1, ParameterSpec(name = "high", label = "Top", value = 1.0, minimum = -100.0, maximum = 100.0, decimals = 2))
+        elif key.starts_with("key"):
+            self.title.set_text("Scale key  ·  " + ("song" if w.key_row == ws.song_keys else "track"))
+            self.add(specs, "key_root", -1, ParameterSpec(name = "root", label = "Root", kind = ParameterKind.menu, items = numbered(catalog.scale_roots(), 0.0), value = 0.0))
+            self.add(specs, "key_mode", -1, ParameterSpec(name = "mode", label = "Scale", kind = ParameterKind.menu, items = numbered(catalog.scale_modes(), 0.0), value = 1.0))
+            self.add(specs, "key_beat", -1, ParameterSpec(name = "beat", label = "From beat", value = 0.0, minimum = 0.0, maximum = 100000.0, decimals = 2, step = 1.0))
+            self.add(specs, "info", -1, ParameterSpec(name = "doc", label = " ", kind = ParameterKind.info, text = "Every track following the song plays its notes in this scale from here to the next key. Delete removes it."))
+        elif key.starts_with("track"):
+            let track = w.selected_track() else return
+            self.title.set_text("Track")
+            self.add(specs, "track_name", -1, ParameterSpec(name = "name", label = "Name", kind = ParameterKind.text, text = track.name))
+            self.add(specs, "channels", -1, ParameterSpec(name = "channels", label = "Channels", kind = ParameterKind.menu, items = "Mono=1|Stereo=2", value = 2.0))
+            self.add(specs, "volume", -1, ParameterSpec(name = "volume", label = "Volume", value = 0.0, minimum = -90.0, maximum = 12.0, soft_minimum = -48.0, soft_maximum = 6.0, decimals = 1, suffix = " dB", slider = true))
+            self.add(specs, "pan", -1, ParameterSpec(name = "pan", label = "Pan", value = 0.0, minimum = -1.0, maximum = 1.0, decimals = 2, slider = true))
+            self.add(specs, "mute", -1, ParameterSpec(name = "mute", label = "Mute", kind = ParameterKind.toggle))
+            self.add(specs, "solo", -1, ParameterSpec(name = "solo", label = "Solo", kind = ParameterKind.toggle))
+            self.add(specs, "color", -1, ParameterSpec(name = "color", label = "Color", kind = ParameterKind.menu, items = "Red=0|Amber=1|Green=2|Teal=3|Blue=4|Violet=5|Pink=6|Grey=7", value = 0.0))
+            if not track.master:
+                self.add(specs, "midi_in", -1, ParameterSpec(name = "midi_in", label = "MIDI in", kind = ParameterKind.menu, items = self.midi_items(), value = 0.0,
+                                                             doc = "The MIDI this track plays live and records. With no track armed the selected track hears it."))
+                self.add(specs, "midi_channel", -1, ParameterSpec(name = "midi_channel", label = "Channel", kind = ParameterKind.menu,
+                                                                  items = "Any=0|1=1|2=2|3=3|4=4|5=5|6=6|7=7|8=8|9=9|10=10|11=11|12=12|13=13|14=14|15=15|16=16", value = 0.0))
+                self.add(specs, "armed", -1, ParameterSpec(name = "armed", label = "Armed", kind = ParameterKind.toggle,
+                                                           doc = "Armed tracks hear MIDI even when not selected, and Record (R) takes what they play."))
+            self.add(specs, "keyed", -1, ParameterSpec(name = "keyed", label = "Scale", kind = ParameterKind.menu, items = "As written=0|Song's keys=1|Its own keys=2", value = 1.0,
+                                                       doc = "How its notes take a scale: as written (drums), the song's Scale row, or its own keys on its row (double-click there to add one)."))
+        else:
+            self.title.set_text("Song")
+            self.add(specs, "tempo", -1, ParameterSpec(name = "tempo", label = "Tempo", value = 120.0, minimum = 20.0, maximum = 400.0, soft_minimum = 60.0, soft_maximum = 200.0, decimals = 1, suffix = " bpm", slider = true))
+            self.add(specs, "meter", -1, ParameterSpec(name = "meter", label = "Beats a bar", kind = ParameterKind.integer, value = 4.0, minimum = 1.0, maximum = 16.0))
+            self.add(specs, "master", -1, ParameterSpec(name = "master", label = "Master", value = 0.0, minimum = -90.0, maximum = 12.0, soft_minimum = -48.0, soft_maximum = 6.0, decimals = 1, suffix = " dB", slider = true))
+            self.add(specs, "info", -1, ParameterSpec(name = "doc", label = " ", kind = ParameterKind.info, text = "Double-click the Scale row under the ruler to add a key change; every track following the song plays in it."))
+        self.panel.set_specs(specs)
+
+    func add(self, specs: list[ParameterSpec], role: str, slot: int, spec: ParameterSpec, node: int = -1):
+        specs.append(spec)
+        self.rows.append(Row(role = role, slot = slot, node = node))
+
+    ## A row for parameter `slot` of patch node `node`.
+    func add_param(self, specs: list[ParameterSpec], node: GraphNode, slot: int, info: catalog.ParamInfo):
+        let key = f"p{node.id}_{slot}"
+        if info.items != "":
+            self.add(specs, "param", slot, ParameterSpec(name = key, label = info.name, kind = ParameterKind.menu, items = numbered(info.items, info.minimum), value = info.initial, doc = catalog.doc(node.kind)), node = node.id)
+        else:
+            let whole = info.units == "" and info.name in ["Octave", "Semitones"]
+            self.add(specs, "param", slot, ParameterSpec(name = key, label = info.name, kind = ParameterKind.integer if whole else ParameterKind.number,
+                                                         value = info.initial, minimum = info.minimum, maximum = info.maximum,
+                                                         soft_minimum = info.minimum, soft_maximum = soft_top(info.maximum, info.logarithmic),
+                                                         decimals = 0 if whole else decimals_for(info.maximum - info.minimum),
+                                                         suffix = " " + info.units if info.units != "" else "", slider = true), node = node.id)
+
+    ## The node row `row` edits.
+    func row_node(self, row: Row) -> GraphNode?:
+        let w = self.workspace
+        if row.node >= 0:
+            if let found = w.patch_node(row.node):
+                return found
+            if let graph = w.shown_graph():
+                return graph.find(row.node)
+        return w.selected_node()
+
+    ## Put the model's values in the rows (a row the user drags keeps its own).
+    func fill(self) -> unit!:
+        let w = self.workspace
+        for index in 0..<self.rows.length:
+            let row = self.rows[index]
+            let value = self.current(row) else continue
+            if self.panel.value(index) != value:
+                self.panel.set_value(index, value)
+
+    func current(self, row: Row) -> float?:
+        let w = self.workspace
+        let role = row.role
+        if role == "param":
+            if let node = self.row_node(row):
+                if row.slot < node.params.length:
+                    return node.params[row.slot]
+        elif role == "voices":
+            if let node = w.selected_node():
+                return float(node.voices)
+        elif role == "velocity" or role == "pitch" or role == "note_start" or role == "note_length":
+            if let found18 = w.edited_clip():
+                let (_, _, clip) = found18
+                if w.picked.length > 0 and w.picked[0] < clip.notes.length:
+                    let note = clip.notes[w.picked[0]]
+                    return note.velocity if role == "velocity" else (float(note.pitch) if role == "pitch" else (note.start if role == "note_start" else note.length))
+        elif role == "start" or role == "length" or role == "loop" or role == "clip_pan":
+            if let found19 = w.edited_clip():
+                let (_, _, clip) = found19
+                return clip.start if role == "start" else (clip.length if role == "length" else (clip.loop if role == "loop" else clip.pan))
+        elif role == "low" or role == "high":
+            if let lane = w.selected_lane():
+                return lane.low if role == "low" else lane.high
+        elif role == "key_root" or role == "key_mode" or role == "key_beat":
+            if let picked = w.selected_key():
+                return float(picked.root) if role == "key_root" else (float(picked.mode) if role == "key_mode" else picked.beat)
+        elif role == "channels" or role == "volume" or role == "pan" or role == "mute" or role == "solo" or role == "color" or role == "keyed" or role == "midi_in" or role == "midi_channel" or role == "armed":
+            if let track = w.selected_track():
+                if role == "keyed":
+                    return float(track.keyed)
+                if role == "midi_in":
+                    return float(track.midi_in)
+                if role == "midi_channel":
+                    return float(track.midi_channel)
+                if role == "armed":
+                    return 1.0 if track.armed else 0.0
+                if role == "channels":
+                    return float(track.channels)
+                if role == "volume":
+                    return track.volume
+                if role == "pan":
+                    return track.pan
+                if role == "mute":
+                    return 1.0 if track.mute else 0.0
+                if role == "solo":
+                    return 1.0 if track.solo else 0.0
+                return float(track.color)
+        elif role == "tempo":
+            return w.song.tempo
+        elif role == "meter":
+            return float(w.song.beats_per_bar)
+        elif role == "master":
+            return w.song.master
+        return none
+
+    func changed(self, index: int) -> unit!:
+        if index < 0 or index >= self.rows.length:
+            return
+        let w = self.workspace
+        let row = self.rows[index]
+        let role = row.role
+        let value = self.panel.value(index)
+        let text = self.panel.text(index)
+        if role == "param":
+            if let node = self.row_node(row):
+                edits.set_param(w, node, row.slot, value)
+            return
+        if role == "name":
+            if let node = w.selected_node():
+                node.name = text
+        elif role == "voices":
+            if let node = w.selected_node():
+                node.voices = int(value)
+        elif role == "velocity" or role == "pitch" or role == "note_start" or role == "note_length":
+            if let found20 = w.edited_clip():
+                let (_, _, clip) = found20
+                for at in w.picked:
+                    if at < clip.notes.length:
+                        if role == "velocity":
+                            clip.notes[at].velocity = value
+                        elif role == "pitch":
+                            clip.notes[at].pitch = int(value)
+                        elif role == "note_start":
+                            clip.notes[at].start = value
+                        else:
+                            clip.notes[at].length = value
+        elif role == "clip_name" or role == "start" or role == "length" or role == "loop" or role == "clip_pan":
+            if let found21 = w.edited_clip():
+                let (_, _, clip) = found21
+                if role == "clip_name":
+                    clip.name = text
+                elif role == "start":
+                    clip.start = value
+                elif role == "length":
+                    clip.length = value
+                elif role == "loop":
+                    clip.loop = value
+                else:
+                    clip.pan = value
+        elif role == "lane_name" or role == "low" or role == "high":
+            if let lane = w.selected_lane():
+                if role == "lane_name":
+                    lane.name = text
+                    if let track = w.selected_track():
+                        if let node = w.song.lane_node(track, lane.id):
+                            node.name = text
+                elif role == "low":
+                    lane.low = value
+                else:
+                    lane.high = value
+        elif role == "track_name":
+            if let track = w.selected_track():
+                track.name = text
+        elif role == "volume" or role == "pan" or role == "mute" or role == "solo":
+            if let track = w.selected_track():
+                edits.set_mix(w, track, value if role == "volume" else track.volume, value if role == "pan" else track.pan,
+                              (value > 0.5) if role == "mute" else track.mute, (value > 0.5) if role == "solo" else track.solo)
+                return
+        elif role == "channels" or role == "color" or role == "keyed" or role == "midi_in" or role == "midi_channel" or role == "armed":
+            if let track = w.selected_track():
+                if role == "midi_in":
+                    track.midi_in = int(value)
+                elif role == "midi_channel":
+                    track.midi_channel = int(value)
+                elif role == "armed":
+                    track.armed = value > 0.5
+                elif role == "channels":
+                    track.channels = int(value)
+                elif role == "keyed":
+                    track.keyed = int(value)
+                else:
+                    track.color = int(value)
+        elif role == "key_root" or role == "key_mode" or role == "key_beat":
+            if let keys = w.keys_of(w.key_row):
+                if w.key >= 0 and w.key < keys.length:
+                    if role == "key_root":
+                        keys[w.key].root = int(value)
+                    elif role == "key_mode":
+                        keys[w.key].mode = int(value)
+                    else:
+                        keys[w.key].beat = value
+                        edits.settle_keys(w, w.key_row, value)
+        elif role == "tempo":
+            w.song.tempo = value
+            w.bridge.engine.set_tempo(value)
+            w.changed(live = true)
+            return
+        elif role == "meter":
+            w.song.beats_per_bar = int(value)
+        elif role == "master":
+            w.song.master = value
+            w.bridge.engine.set_master(10.0 ** (value / 20.0))
+            w.changed(live = true)
+            return
+        w.changed()
+
+## A menu's items numbered from `first` ("Sine=0|Saw=1"), as the engine
+## counts them.
+func numbered(items: str, first: float) -> str:
+    let parts = items.split("|")
+    let made: list[str] = []
+    for at in 0..<parts.length:
+        made.append(f"{parts[at]}={int(first) + at}")
+    return made.join("|")
+
+func decimals_for(span: float) -> int:
+    if span >= 1000.0:
+        return 0
+    if span >= 50.0:
+        return 1
+    if span >= 5.0:
+        return 2
+    return 3
+
+## The slider's top for a range: a logarithmic one (a frequency, a time)
+## gives the low end room with a shorter slider.
+func soft_top(maximum: float, logarithmic: bool) -> float:
+    if logarithmic:
+        return maximum / 4.0
+    return maximum

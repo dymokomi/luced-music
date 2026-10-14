@@ -1,0 +1,457 @@
+## The document: a song's tracks, each with its lanes (subtracks) of clips
+## and the rack of instruments and effects it plays through, every
+## instrument a patch of the engine's nodes. Everything that plays has an
+## id from the song's counter; the engine carries a voice or a filter's
+## state across edits by these ids, so they never change once given.
+import catalog
+
+## A note in a clip: its start and length in beats from the clip's start.
+pub struct Note:
+    pub var start: float
+    pub var length: float
+    pub var pitch: int
+    pub var velocity: float
+
+## A curve point in a clip: its beat from the clip's start, its value, and
+## whether the curve ramps to the next point (0) or holds until it (1).
+pub struct Point:
+    pub var beat: float
+    pub var value: float
+    pub var shape: int
+
+pub class Clip:
+    pub let id: int
+    pub var name: str
+    ## Where it starts on the timeline and how long it plays, in beats.
+    pub var start: float
+    pub var length: float
+    ## Its content's length: the content repeats until the clip ends.
+    pub var loop: float
+    pub var notes: list[Note]
+    pub var points: list[Point]
+    ## Where its notes sit between the speakers, -1 to 1.
+    pub var pan: float = 0.0
+
+    pub func init(self, id: int, name: str, start: float, length: float):
+        self.id = id
+        self.name = name
+        self.start = start
+        self.length = length
+        self.loop = length
+        self.notes = []
+        self.points = []
+
+    pub func end(self) -> float:
+        return self.start + self.length
+
+    ## An independent copy, keeping the id (`with_id` gives another).
+    pub func copy(self, with_id: int = -1) -> Clip:
+        let made = Clip(self.id if with_id < 0 else with_id, self.name, self.start, self.length)
+        made.loop = self.loop
+        made.notes = self.notes.copy()
+        made.points = self.points.copy()
+        made.pan = self.pan
+        return made
+
+## A scale key: from `beat` on, notes take mode `mode` (the engine's
+## `scale_modes`: 0 Chromatic, 1 Major, 2 Minor…) on `root` (0 C … 11 B),
+## until the next key. The song keeps a row of them (its key changes) and a
+## track may keep its own.
+pub struct ScaleKey:
+    pub var beat: float
+    pub var root: int
+    pub var mode: int
+
+## How a track's notes take a scale.
+pub let keyed_written: int = 0
+pub let keyed_song: int = 1
+pub let keyed_own: int = 2
+
+## The key in force at `beat` among `keys` (in beat order): the last at or
+## before it, the first before them all, none without keys.
+pub func key_at(keys: list[ScaleKey], beat: float) -> ScaleKey?:
+    if keys.length == 0:
+        return none
+    var found = keys[0]
+    for key in keys:
+        if key.beat <= beat:
+            found = key
+    return found
+
+## Put `keys` in beat order.
+pub func sort_keys(keys: list[ScaleKey]) -> list[ScaleKey]:
+    let sorted = keys.copy()
+    sorted.sort(key = (key) => key.beat)
+    return sorted
+
+## A subtrack: a row of clips, all notes or all curves.
+pub class Lane:
+    pub let id: int
+    pub var name: str
+    pub let curve: bool
+    pub var clips: list[Clip]
+    ## A curve's range on screen and in the editor.
+    pub var low: float = 0.0
+    pub var high: float = 1.0
+
+    pub func init(self, id: int, name: str, curve: bool):
+        self.id = id
+        self.name = name
+        self.curve = curve
+        self.clips = []
+
+    pub func copy(self) -> Lane:
+        let made = Lane(self.id, self.name, self.curve)
+        made.clips = self.clips.map((clip) => clip.copy())
+        made.low = self.low
+        made.high = self.high
+        return made
+
+## A wire in a graph: an output of one node to an input of another.
+pub struct Wire:
+    pub var source: int
+    pub var output: int
+    pub var target: int
+    pub var input: int
+
+## A node of a graph: in a rack a lane's source, a device or the track's
+## output; in a patch one of the engine's kinds (catalog.luc).
+pub class GraphNode:
+    pub let id: int
+    pub let kind: int
+    pub var name: str
+    pub var x: float
+    pub var y: float
+    pub var params: list[float]
+    ## A device's patch and voices.
+    pub var patch: Graph?
+    pub var voices: int = 1
+    ## A lane node's lane.
+    pub var lane: int = -1
+    ## An Inlet's or Outlet's place among its group's sockets.
+    pub var port: int = -1
+
+    pub func init(self, id: int, kind: int, name: str, x: float, y: float):
+        self.id = id
+        self.kind = kind
+        self.name = name
+        self.x = x
+        self.y = y
+        self.params = catalog.defaults(kind)
+        self.patch = none
+
+    pub func copy(self) -> GraphNode:
+        let made = GraphNode(self.id, self.kind, self.name, self.x, self.y)
+        made.params = self.params.copy()
+        made.voices = self.voices
+        made.lane = self.lane
+        made.port = self.port
+        if let inner = self.patch:
+            made.patch = inner.copy()
+        return made
+
+    ## A copy with new ids from `song`, its patch's too: what a preset or a
+    ## duplicate places, so the engine never takes it for the original.
+    pub func fresh(self, song: Song) -> GraphNode:
+        let made = GraphNode(song.next_id(), self.kind, self.name, self.x, self.y)
+        made.params = self.params.copy()
+        made.voices = self.voices
+        made.lane = self.lane
+        made.port = self.port
+        if let inner = self.patch:
+            made.patch = inner.fresh(song)
+        return made
+
+pub class Graph:
+    pub var nodes: list[GraphNode]
+    pub var wires: list[Wire]
+
+    pub func init(self):
+        self.nodes = []
+        self.wires = []
+
+    pub func copy(self) -> Graph:
+        let made = Graph()
+        made.nodes = self.nodes.map((node) => node.copy())
+        made.wires = self.wires.copy()
+        return made
+
+    ## A copy with new ids throughout, its wires following.
+    pub func fresh(self, song: Song) -> Graph:
+        let made = Graph()
+        let renamed: map[int, int] = {}
+        for node in self.nodes:
+            let copy = node.fresh(song)
+            renamed[node.id] = copy.id
+            made.nodes.append(copy)
+        for wire in self.wires:
+            if let source = renamed[wire.source]:
+                if let target = renamed[wire.target]:
+                    made.wires.append(Wire(source = source, output = wire.output, target = target, input = wire.input))
+        return made
+
+    ## Node `id` here or inside a group at any depth.
+    pub func find_deep(self, id: int) -> GraphNode?:
+        for node in self.nodes:
+            if node.id == id:
+                return node
+            if let inner = node.patch:
+                if let found = inner.find_deep(id):
+                    return found
+        return none
+
+    pub func find(self, id: int) -> GraphNode?:
+        for node in self.nodes:
+            if node.id == id:
+                return node
+        return none
+
+    pub func index_of(self, id: int) -> int:
+        for at in 0..<self.nodes.length:
+            if self.nodes[at].id == id:
+                return at
+        return -1
+
+    ## The wire into `target`'s input `input`, if any.
+    pub func wire_into(self, target: int, input: int) -> Wire?:
+        for wire in self.wires:
+            if wire.target == target and wire.input == input:
+                return wire
+        return none
+
+    ## Whether `source` feeds `target`, directly or through other nodes.
+    pub func reaches(self, source: int, target: int) -> bool:
+        if source == target:
+            return true
+        let seen: set[int] = {source}
+        var frontier = [source]
+        while frontier.length > 0:
+            let at = frontier.pop()
+            for wire in self.wires:
+                if wire.source == at and not (wire.target in seen):
+                    if wire.target == target:
+                        return true
+                    seen.insert(wire.target)
+                    frontier.append(wire.target)
+        return false
+
+    ## Connect, replacing what fed that input (an audio input sums several
+    ## sources, so it keeps them). A wire that would close a loop is refused.
+    pub func connect(self, wire: Wire, sums: bool = false) -> bool:
+        if self.reaches(wire.target, wire.source):
+            return false
+        for existing in self.wires:
+            if existing == wire:
+                return true
+        if not sums:
+            self.wires = self.wires.filter((w) => not (w.target == wire.target and w.input == wire.input))
+        self.wires.append(wire)
+        return true
+
+    pub func disconnect(self, target: int, input: int):
+        self.wires = self.wires.filter((w) => not (w.target == target and w.input == input))
+
+    pub func remove(self, id: int):
+        self.nodes = self.nodes.filter((n) => n.id != id)
+        self.wires = self.wires.filter((w) => w.source != id and w.target != id)
+
+pub class Track:
+    pub let id: int
+    pub var name: str
+    pub var channels: int = 2
+    ## Volume in dB and pan -1..1.
+    pub var volume: float = 0.0
+    pub var pan: float = 0.0
+    pub var mute: bool = false
+    pub var solo: bool = false
+    pub var color: int = 0
+    pub var lanes: list[Lane]
+    pub var rack: Graph
+    pub var folded: bool = false
+    ## The master bus: its rack's effects hear every other track's mix.
+    pub var master: bool = false
+    ## Its notes' scale: as written, the song's keys, or its own `keys`.
+    pub var keyed: int = 1
+    pub var keys: list[ScaleKey]
+    ## The MIDI it plays live and records: a source (-1 none, 0 every one,
+    ## else the engine's id for one) on a channel (0 any, 1..16); armed, it
+    ## listens even when not selected and records.
+    pub var midi_in: int = 0
+    pub var midi_channel: int = 0
+    pub var armed: bool = false
+
+    pub func init(self, id: int, name: str, color: int):
+        self.id = id
+        self.name = name
+        self.color = color
+        self.lanes = []
+        self.rack = Graph()
+        self.keys = []
+
+    pub func lane(self, id: int) -> Lane?:
+        for lane in self.lanes:
+            if lane.id == id:
+                return lane
+        return none
+
+    pub func copy(self) -> Track:
+        let made = Track(self.id, self.name, self.color)
+        made.channels = self.channels
+        made.volume = self.volume
+        made.pan = self.pan
+        made.mute = self.mute
+        made.solo = self.solo
+        made.lanes = self.lanes.map((lane) => lane.copy())
+        made.rack = self.rack.copy()
+        made.folded = self.folded
+        made.master = self.master
+        made.keyed = self.keyed
+        made.keys = self.keys.copy()
+        made.midi_in = self.midi_in
+        made.midi_channel = self.midi_channel
+        made.armed = self.armed
+        return made
+
+    ## The lane live MIDI plays and a recording lands in: its first notes lane.
+    pub func record_lane(self) -> Lane?:
+        for lane in self.lanes:
+            if not lane.curve:
+                return lane
+        return none
+
+pub class Song:
+    pub var name: str = "Untitled"
+    pub var tempo: float = 120.0
+    pub var beats_per_bar: int = 4
+    pub var tracks: list[Track]
+    pub var loop_on: bool = false
+    pub var loop_start: float = 0.0
+    pub var loop_end: float = 16.0
+    pub var master: float = 0.0
+    ## The song's scale: its key changes, which every track following the
+    ## song takes. None: notes play as written.
+    pub var keys: list[ScaleKey]
+    var counter: int = 1
+
+    pub func init(self):
+        self.tracks = []
+        self.keys = []
+
+    ## An independent copy of the whole song, ids and all.
+    pub func copy(self) -> Song:
+        let made = Song()
+        made.name = self.name
+        made.tempo = self.tempo
+        made.beats_per_bar = self.beats_per_bar
+        made.tracks = self.tracks.map((track) => track.copy())
+        made.loop_on = self.loop_on
+        made.loop_start = self.loop_start
+        made.loop_end = self.loop_end
+        made.master = self.master
+        made.keys = self.keys.copy()
+        made.counter = self.counter
+        return made
+
+    ## A new id, never given before in this song.
+    pub func next_id(self) -> int:
+        self.counter += 1
+        return self.counter
+
+    ## Make sure later ids are past `id` (a loaded song's largest).
+    pub func saw_id(self, id: int):
+        if id >= self.counter:
+            self.counter = id + 1
+
+    pub func last_id(self) -> int:
+        return self.counter
+
+    pub func track(self, id: int) -> Track?:
+        for track in self.tracks:
+            if track.id == id:
+                return track
+        return none
+
+    ## The track holding lane `id`.
+    pub func track_of_lane(self, id: int) -> Track?:
+        for track in self.tracks:
+            if track.lane(id) != none:
+                return track
+        return none
+
+    ## The clip `id`, with its lane and track.
+    pub func clip(self, id: int) -> (Track, Lane, Clip)?:
+        for track in self.tracks:
+            for lane in track.lanes:
+                for clip in lane.clips:
+                    if clip.id == id:
+                        return (track, lane, clip)
+        return none
+
+    ## Whether `track` hears live MIDI: the armed tracks, or with none armed
+    ## the selected one (`selected`, a track id).
+    pub func listening(self, track: Track, selected: int) -> bool:
+        if track.master or track.midi_in < 0:
+            return false
+        for other in self.tracks:
+            if other.armed:
+                return track.armed
+        return track.id == selected
+
+    ## The key `track`'s notes take at `beat`; none plays them as written.
+    pub func key_for(self, track: Track, beat: float) -> ScaleKey?:
+        if track.keyed == keyed_written:
+            return none
+        let song_key = key_at(self.keys, beat)
+        if track.keyed == keyed_own:
+            if let own = key_at(track.keys, beat):
+                return own
+        return song_key
+
+    ## The beat the last clip ends on.
+    pub func length(self) -> float:
+        var end = 0.0
+        for track in self.tracks:
+            for lane in track.lanes:
+                for clip in lane.clips:
+                    if clip.end() > end:
+                        end = clip.end()
+        return end
+
+    ## A lane on `track`, with its node in the track's rack.
+    pub func add_lane(self, track: Track, name: str, curve: bool) -> Lane:
+        let lane = Lane(self.next_id(), name, curve)
+        track.lanes.append(lane)
+        let node = GraphNode(self.next_id(), catalog.lane_kind, name, 20.0, 30.0 + 100.0 * float(track.lanes.length - 1))
+        node.lane = lane.id
+        track.rack.nodes.append(node)
+        return lane
+
+    ## A track with its output node.
+    pub func add_track(self, name: str) -> Track:
+        let track = Track(self.next_id(), name, self.tracks.length % 8)
+        track.rack.nodes.append(GraphNode(self.next_id(), catalog.output_kind, "Track Out", 500.0, 30.0))
+        self.tracks.append(track)
+        return track
+
+    ## The master track, made (last, with no lanes) the first time it is asked for.
+    pub func master_track(self) -> Track:
+        for track in self.tracks:
+            if track.master:
+                return track
+        let track = self.add_track("Master")
+        track.master = true
+        return track
+
+    ## The rack's output node of `track`.
+    pub func output_of(self, track: Track) -> GraphNode?:
+        for node in track.rack.nodes:
+            if node.kind == catalog.output_kind:
+                return node
+        return none
+
+    ## The rack node of lane `lane`.
+    pub func lane_node(self, track: Track, lane: int) -> GraphNode?:
+        for node in track.rack.nodes:
+            if node.kind == catalog.lane_kind and node.lane == lane:
+                return node
+        return none

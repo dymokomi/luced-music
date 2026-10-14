@@ -1,0 +1,10 @@
+## The app made on the demo song and drawing three frames, no audio device.
+from app import LucedMusic
+import presets
+
+pub func main(arguments: list[str]) -> int!:
+    let music = LucedMusic(presets.demo_song())
+    music.run(["luced-music", "--smoke"])
+    music.close()
+    print("PASS smoke: the app drew three frames on the demo song")
+    return 0

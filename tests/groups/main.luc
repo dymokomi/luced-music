@@ -1,0 +1,83 @@
+## Groups and presets: collapsing nodes into a group (and expanding it)
+## changes nothing the engine plays; a group saves as a module and a device
+## as an instrument, each placed again with fresh ids; a song with a group
+## round-trips through its file.
+from presets import demo_song
+from bridge import Bridge
+from song import Song, GraphNode
+import groups
+import library
+import project
+import catalog
+from luce_std import files, paths
+
+## The first second of `song`, as samples of its left channel.
+func render(song: Song) -> list[float]!:
+    let bridge = Bridge(48000.0)
+    bridge.publish(song)
+    bridge.engine.play()
+    bridge.engine.render(48000)
+    let samples: list[float] = []
+    for i in 0..<48000:
+        samples.append(bridge.engine.sample(0, i))
+    bridge.close()
+    return samples
+
+func lead_device(song: Song) -> GraphNode:
+    for node in song.tracks[0].rack.nodes:
+        if node.kind == catalog.device_kind:
+            return node
+    trap("no device")
+
+func same(a: list[float], b: list[float]) -> bool:
+    if a.length != b.length:
+        return false
+    for i in 0..<a.length:
+        let d = a[i] - b[i]
+        if d > 0.000001 or d < -0.000001:
+            return false
+    return true
+
+pub func main(arguments: list[str]) -> int!:
+    let song = demo_song()
+    let before = render(song)
+    let device = lead_device(song)
+    let patch = device.patch else trap("no patch")
+    # The two oscillators and their mix, collapsed.
+    let picked: list[int] = []
+    for node in patch.nodes:
+        if node.kind == catalog.named("Oscillator") or (node.kind == catalog.named("Mix") and picked.length == 2):
+            picked.append(node.id)
+    assert(picked.length == 3, f"picked {picked.length}")
+    let group = groups.collapse(song, patch, picked) else trap("nothing collapsed")
+    assert(groups.inputs(group).length == 1, "one inlet: the pitch both oscillators share")
+    assert(groups.outputs(group).length == 1, "one outlet: the mix")
+    assert(same(before, render(song)), "a group plays as its nodes did")
+    # Saved and loaded with the song, it still plays the same.
+    let file = paths.join(files.home_directory(), "grouped.prisma")
+    project.save(song, file)
+    let loaded = project.load(file)
+    assert(same(before, render(loaded)), "the group round-trips through a song file")
+    # As a module: saved, listed, placed again with fresh ids.
+    group.name = "Two Saws"
+    library.save(library.modules, "Two Saws", group)
+    assert("Two Saws" in library.names(library.modules), "the module is listed")
+    let module = library.load(library.modules, "Two Saws")
+    let placed = module.fresh(song)
+    assert(placed.id != group.id and placed.name == "Two Saws", "a placed module has its own id")
+    let inner = placed.patch else trap("no module patch")
+    for node in inner.nodes:
+        assert(patch.find_deep(node.id) == none, "a placed module's nodes have their own ids")
+    # Expanded back, it plays as before.
+    groups.expand(patch, group)
+    assert(patch.find(group.id) == none, "the group is gone")
+    assert(same(before, render(song)), "expanding restores the patch")
+    # The device as an instrument preset, placed on the bass track.
+    library.save(library.instruments, "My Lead", device)
+    let instrument = library.load(library.instruments, "My Lead").fresh(song)
+    song.tracks[1].rack.nodes.append(instrument)
+    let bridge = Bridge(48000.0)
+    bridge.publish(song)
+    bridge.close()
+    print("PASS groups: collapse, expand, modules and instruments keep the sound")
+    return 0

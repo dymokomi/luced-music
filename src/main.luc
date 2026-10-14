@@ -1,0 +1,22 @@
+## luced-music's entry: opens the song named (a .prisma file), else the
+## demo song. `--no-audio` starts with the output off; `--smoke` draws three
+## frames without a device and quits.
+from app import LucedMusic
+import presets
+import project
+
+pub func main(arguments: list[str]) -> int!:
+    var song = presets.demo_song()
+    var path = ""
+    for argument in arguments:
+        if argument.ends_with(".prisma"):
+            path = argument
+    if path != "":
+        song = project.load(path)
+    let music = LucedMusic(song)
+    music.workspace.path = path
+    music.run(arguments) catch failure:
+        music.close()
+        error(failure.code, failure.message)
+    music.close()
+    return 0

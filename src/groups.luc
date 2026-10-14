@@ -1,0 +1,224 @@
+## Groups in a patch: nodes collapsed into one node that holds them, its
+## sockets the Inlet and Outlet nodes inside (in the order of their `port`).
+## The engine never sees a group: `flatten` gives it every engine node at any
+## depth with the wires between them, each Inlet and Outlet passed through.
+## `collapse` and `expand` move nodes into a group and back, rerouting the
+## wires that cross its edge.
+from song import Song, Graph, GraphNode, Wire
+from catalog import Port
+import catalog
+
+## The Inlets (or Outlets) of `group`'s patch, in socket order.
+pub func sockets(group: GraphNode, kind: int) -> list[GraphNode]:
+    let found: list[GraphNode] = []
+    if let inner = group.patch:
+        for node in inner.nodes:
+            if node.kind == kind:
+                found.append(node)
+    found.sort(key = (node) => node.port)
+    return found
+
+## A patch node's inputs and outputs: its kind's, or a group's sockets.
+pub func inputs(node: GraphNode) -> list[Port]:
+    if node.kind == catalog.group_kind:
+        return sockets(node, catalog.inlet_kind).map((inlet) => Port(name = inlet.name, kind = catalog.signal, slot = inlet.port))
+    if node.kind == catalog.outlet_kind:
+        return [Port(name = node.name, kind = catalog.signal, slot = 0)]
+    if node.kind == catalog.inlet_kind:
+        return []
+    return catalog.inputs(node.kind)
+
+pub func outputs(node: GraphNode) -> list[Port]:
+    if node.kind == catalog.group_kind:
+        return sockets(node, catalog.outlet_kind).map((outlet) => Port(name = outlet.name, kind = catalog.signal, slot = outlet.port))
+    if node.kind == catalog.inlet_kind:
+        return [Port(name = node.name, kind = catalog.signal, slot = 0)]
+    if node.kind == catalog.outlet_kind:
+        return []
+    return catalog.outputs(node.kind)
+
+## The next socket number for an Inlet or Outlet in `graph`.
+pub func next_port(graph: Graph, kind: int) -> int:
+    var most = -1
+    for node in graph.nodes:
+        if node.kind == kind and node.port > most:
+            most = node.port
+    return most + 1
+
+# ------------------------------------------------ flattening
+
+## A graph with the groups it sits in, innermost last: (the graph holding
+## the group, the group).
+struct Place:
+    var graph: Graph
+    var parents: list[(Graph, GraphNode)]
+
+pub struct Flat:
+    pub var nodes: list[GraphNode]
+    pub var wires: list[Wire]
+
+## Every engine node of `patch`, inside groups too, and the wires between
+## them with groups, Inlets and Outlets passed through.
+pub func flatten(patch: Graph) -> Flat:
+    let flat = Flat(nodes = [], wires = [])
+    let places: list[Place] = []
+    collect(patch, [], flat, places)
+    for place in places:
+        for wire in place.graph.wires:
+            if let target = place.graph.find(wire.target):
+                if not catalog.is_patch(target.kind):
+                    continue
+                if let found = resolve(place.graph, place.parents, wire.source, wire.output, 0):
+                    let (source, output) = found
+                    flat.wires.append(Wire(source = source, output = output, target = wire.target, input = wire.input))
+    return flat
+
+func collect(graph: Graph, parents: list[(Graph, GraphNode)], flat: Flat, places: list[Place]):
+    places.append(Place(graph = graph, parents = parents))
+    for node in graph.nodes:
+        if catalog.is_patch(node.kind):
+            flat.nodes.append(node)
+        elif node.kind == catalog.group_kind:
+            if let inner = node.patch:
+                collect(inner, parents + [(graph, node)], flat, places)
+
+## The engine node and output that output `output` of node `id` in `graph`
+## really is, following Inlets out and groups in; none when nothing feeds it.
+func resolve(graph: Graph, parents: list[(Graph, GraphNode)], id: int, output: int, depth: int) -> (int, int)?:
+    if depth > 64:
+        return none
+    let node = graph.find(id) else return none
+    if catalog.is_patch(node.kind):
+        return (id, output)
+    if node.kind == catalog.inlet_kind:
+        if parents.length == 0:
+            return none
+        let (outer, group) = parents[parents.length - 1]
+        let feed = outer.wire_into(group.id, node.port) else return none
+        return resolve(outer, parents[0..<parents.length - 1], feed.source, feed.output, depth + 1)
+    if node.kind == catalog.group_kind:
+        let inner = node.patch else return none
+        for outlet in inner.nodes:
+            if outlet.kind == catalog.outlet_kind and outlet.port == output:
+                let feed = inner.wire_into(outlet.id, 0) else return none
+                return resolve(inner, parents + [(graph, node)], feed.source, feed.output, depth + 1)
+    return none
+
+# ------------------------------------------------ collapsing
+
+## Move nodes `picked` of `graph` into a new group at their middle; wires
+## crossing its edge go through new Inlets and Outlets (one per outside
+## source, one per inside output). Answers the group.
+pub func collapse(song: Song, graph: Graph, picked: list[int]) -> GraphNode?:
+    let moved = graph.nodes.filter((node) => node.id in picked and catalog.in_patch(node.kind) and node.kind != catalog.inlet_kind and node.kind != catalog.outlet_kind)
+    if moved.length == 0:
+        return none
+    let ids = moved.map((node) => node.id)
+    var left = moved[0].x
+    var right = moved[0].x
+    var top = moved[0].y
+    var sum_x = 0.0
+    var sum_y = 0.0
+    for node in moved:
+        left = node.x if node.x < left else left
+        right = node.x if node.x > right else right
+        top = node.y if node.y < top else top
+        sum_x += node.x
+        sum_y += node.y
+    let group = GraphNode(song.next_id(), catalog.group_kind, "Group", sum_x / float(moved.length), sum_y / float(moved.length))
+    let inner = Graph()
+    inner.nodes = moved
+    let inlets: map[(int, int), GraphNode] = {}
+    let outlets: map[(int, int), GraphNode] = {}
+    let outer: list[Wire] = []
+    for wire in graph.wires:
+        let from_inside = wire.source in ids
+        let to_inside = wire.target in ids
+        if from_inside and to_inside:
+            inner.wires.append(wire)
+        elif to_inside:
+            let key = (wire.source, wire.output)
+            var inlet = inlets[key]
+            if inlet == none:
+                let made = GraphNode(song.next_id(), catalog.inlet_kind, socket_name(graph, wire.source, wire.output, false), left - 220.0, top + 60.0 * float(inlets.length))
+                made.port = inlets.length
+                inner.nodes.append(made)
+                inlets[key] = made
+                outer.append(Wire(source = wire.source, output = wire.output, target = group.id, input = made.port))
+                inlet = made
+            if let socket = inlet:
+                inner.wires.append(Wire(source = socket.id, output = 0, target = wire.target, input = wire.input))
+        elif from_inside:
+            let key = (wire.source, wire.output)
+            var outlet = outlets[key]
+            if outlet == none:
+                let made = GraphNode(song.next_id(), catalog.outlet_kind, socket_name(graph, wire.source, wire.output, true), right + 240.0, top + 60.0 * float(outlets.length))
+                made.port = outlets.length
+                inner.nodes.append(made)
+                outlets[key] = made
+                inner.wires.append(Wire(source = wire.source, output = wire.output, target = made.id, input = 0))
+                outlet = made
+            if let socket = outlet:
+                outer.append(Wire(source = group.id, output = socket.port, target = wire.target, input = wire.input))
+        else:
+            outer.append(wire)
+    group.patch = inner
+    graph.nodes = graph.nodes.filter((node) => not (node.id in ids))
+    graph.nodes.append(group)
+    graph.wires = outer
+    return group
+
+## A socket's name: the port it stands for ("pitch", "out").
+func socket_name(graph: Graph, node: int, output: int, inside: bool) -> str:
+    if let source = graph.find(node):
+        for port in outputs(source):
+            if port.slot == output:
+                return port.name
+    return "in" if not inside else "out"
+
+## Put `group`'s nodes back into `graph` where it stands, its Inlets and
+## Outlets replaced by the wires through them.
+pub func expand(graph: Graph, group: GraphNode):
+    let inner = group.patch else return
+    var sum_x = 0.0
+    var sum_y = 0.0
+    var count = 0
+    for node in inner.nodes:
+        if node.kind != catalog.inlet_kind and node.kind != catalog.outlet_kind:
+            sum_x += node.x
+            sum_y += node.y
+            count += 1
+    let shift_x = group.x - (sum_x / float(count) if count > 0 else group.x)
+    let shift_y = group.y - (sum_y / float(count) if count > 0 else group.y)
+    let wires: list[Wire] = []
+    let socket_ids: list[int] = []
+    for node in inner.nodes:
+        if node.kind == catalog.inlet_kind or node.kind == catalog.outlet_kind:
+            socket_ids.append(node.id)
+    for wire in inner.wires:
+        if not (wire.source in socket_ids) and not (wire.target in socket_ids):
+            wires.append(wire)
+    for wire in graph.wires:
+        if wire.target == group.id:
+            # Into the group: on to whatever its Inlet feeds.
+            for inlet in inner.nodes:
+                if inlet.kind == catalog.inlet_kind and inlet.port == wire.input:
+                    for inside in inner.wires:
+                        if inside.source == inlet.id and not (inside.target in socket_ids):
+                            wires.append(Wire(source = wire.source, output = wire.output, target = inside.target, input = inside.input))
+        elif wire.source == group.id:
+            # Out of it: from whatever feeds its Outlet.
+            for outlet in inner.nodes:
+                if outlet.kind == catalog.outlet_kind and outlet.port == wire.output:
+                    if let inside = inner.wire_into(outlet.id, 0):
+                        if not (inside.source in socket_ids):
+                            wires.append(Wire(source = inside.source, output = inside.output, target = wire.target, input = wire.input))
+        else:
+            wires.append(wire)
+    graph.nodes = graph.nodes.filter((node) => node.id != group.id)
+    for node in inner.nodes:
+        if not (node.id in socket_ids):
+            node.x += shift_x
+            node.y += shift_y
+            graph.nodes.append(node)
+    graph.wires = wires

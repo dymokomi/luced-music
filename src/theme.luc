@@ -1,0 +1,96 @@
+## luced-3d's palette (its greys and #E7A03F orange, in linear light), with
+## what a music editor adds: track colors, the colors of a wire's kind, and
+## the piano roll's keys.
+from luce_ui.ui import Theme
+from luce_ui import ui
+from luce_gpu.gpu import Color
+from luce_color import transfer
+
+pub func grey(byte: float) -> Color:
+    let value = transfer.srgb_decode(byte / 255.0)
+    return Color(value, value, value)
+
+pub func srgb(r: float, g: float, b: float, alpha: float = 1.0) -> Color:
+    return Color(transfer.srgb_decode(r / 255.0), transfer.srgb_decode(g / 255.0), transfer.srgb_decode(b / 255.0), alpha)
+
+pub func accent() -> Color:
+    return srgb(231.0, 160.0, 63.0)
+
+pub func warning() -> Color:
+    return srgb(226.0, 198.0, 70.0)
+
+pub func failure() -> Color:
+    return srgb(222.0, 72.0, 62.0)
+
+pub func backdrop() -> Color:
+    return grey(26.0)
+pub func tab_strip() -> Color:
+    return grey(38.0)
+pub func surface() -> Color:
+    return grey(50.0)
+pub func surface_raised() -> Color:
+    return grey(46.0)
+pub func border() -> Color:
+    return grey(58.0)
+pub func text() -> Color:
+    return grey(217.0)
+pub func text_muted() -> Color:
+    return grey(140.0)
+
+pub func disabled(ink: Color) -> Color:
+    return Color(ink.red, ink.green, ink.blue, ink.alpha * ui.disabled_opacity)
+
+## The eight track colors, muted to sit with the greys.
+pub func track_color(index: int) -> Color:
+    let palette = [(214.0, 120.0, 92.0), (222.0, 172.0, 80.0), (150.0, 190.0, 100.0), (88.0, 182.0, 160.0),
+                   (96.0, 150.0, 214.0), (150.0, 120.0, 214.0), (200.0, 110.0, 170.0), (170.0, 170.0, 170.0)]
+    let (r, g, b) = palette[index % 8]
+    return srgb(r, g, b)
+
+## A track color darkened for a clip's body.
+pub func track_shade(index: int, amount: float) -> Color:
+    let c = track_color(index)
+    return Color(c.red * amount, c.green * amount, c.blue * amount, 1.0)
+
+## What a wire carries: notes green, audio the accent, control blue, a
+## patch's signals grey.
+pub func port_color(kind: int) -> Color:
+    if kind == 1:
+        return srgb(140.0, 196.0, 110.0)
+    if kind == 2:
+        return accent()
+    if kind == 3:
+        return srgb(110.0, 165.0, 220.0)
+    return grey(170.0)
+
+pub func playhead() -> Color:
+    return srgb(240.0, 240.0, 240.0)
+
+pub func loop_band() -> Color:
+    return srgb(231.0, 160.0, 63.0, 0.18)
+
+pub func editor_theme() -> Theme!:
+    var theme = Theme()
+    theme.background = backdrop()
+    theme.panel = surface()
+    theme.gutter = tab_strip()
+    theme.foreground = text()
+    theme.muted = text_muted()
+    theme.selection = accent()
+    theme.accent = accent()
+    theme.button = grey(41.0)
+    theme.button_hover = grey(58.0)
+    theme.pressed = grey(72.0)
+    theme.menu = surface_raised()
+    theme.menu_hover = grey(64.0)
+    theme.strip = tab_strip()
+    theme.sunken = grey(41.0)
+    theme.raised = surface_raised()
+    theme.accent_text = grey(0.0)
+    theme.menu_selection = accent()
+    theme.border = border()
+    theme.active_border = grey(150.0)
+    theme.shadow_offset = 0.0
+    theme.shadow_opacity = 0.0
+    theme.control_radius = 5.0
+    return theme

@@ -1,0 +1,124 @@
+## The application: the window and its panels, the engine's poll each turn
+## of the loop, files, and the audio device.
+from luce_ui.ui import Application, Font, Notifier
+from interop import Connection
+from workspace import Workspace
+from panels import Panels
+from song import Song
+import presets
+import project
+import theme
+from luce_std import paths
+
+pub class LucedMusic:
+    pub let app: Application
+    pub let workspace: Workspace
+    pub let panels: Panels
+    let connections: list[Connection]
+    let ticking: Connection
+    ## Told (from CoreMIDI's thread) when MIDI messages wait.
+    var midi: Notifier? = none
+
+    pub func init(self, song: Song, width: int = 1500, height: int = 940) -> unit!:
+        self.connections = []
+        self.workspace = Workspace(song)
+        self.panels = Panels(self.workspace, Font())
+        self.app = Application(self.panels.body, title = "Luced Music", width = width, height = height, theme = theme.editor_theme())
+        self.app.set_commands(self.panels.actions.all())
+        self.app.focus(self.panels.arrangement.layout())
+        # No timer: each turn of the loop (an event, or a wake asked for here)
+        # polls the engine, and the loop wakes at 60 Hz only while something
+        # moves: the playhead, a falling meter, a program swap settling.
+        self.ticking = self.app.on_frame(func (seconds: float) -> unit!:
+            if self.panels.poll(seconds):
+                self.app.wake_after(1.0 / 60.0))
+        # Live MIDI: the engine plays it; the main thread hears it to record.
+        let notifier = self.app.notifier(self.take_midi)
+        self.midi = notifier
+        self.workspace.bridge.engine.open_midi(notifier.waker()) catch failure:
+            print(f"luced-music: no MIDI input: {failure.message}")
+        self.app.set_error_handler(func (message: str) -> unit!:
+            print(f"luced-music: {message}"))
+        let a = self.panels.actions
+        self.connections.append(a.new_song.on_trigger(func () -> unit!:
+            self.workspace.replace(presets.demo_song())
+            self.workspace.path = ""
+            self.retitle()))
+        self.connections.append(a.open_song.on_trigger(func () -> unit!:
+            let path = self.app.open_file("Open a song (.prisma)")
+            if path != "":
+                self.open(path)))
+        self.connections.append(a.save.on_trigger(self.save))
+        self.connections.append(a.save_as.on_trigger(func () -> unit!:
+            self.save_as()))
+        self.connections.append(a.audio.on_trigger(self.toggle_audio))
+        self.retitle()
+
+    ## The MIDI messages that came in: to the take, and the activity light.
+    func take_midi(self) -> unit!:
+        let engine = self.workspace.bridge.engine
+        var any = false
+        while engine.midi_next():
+            any = true
+            self.panels.actions.recorder.hear(self.workspace, engine.midi_status(), engine.midi_data1(), engine.midi_data2(), engine.midi_source(), engine.midi_nanos())
+        if any:
+            self.panels.midi_seen()
+        if engine.midi_generation() != self.panels.midi_generation:
+            self.panels.midi_generation = engine.midi_generation()
+            self.panels.inspector.sources_changed()
+
+    pub func open(self, path: str) -> unit!:
+        let song = project.load(path)
+        self.workspace.replace(song)
+        self.workspace.path = path
+        self.retitle()
+
+    func save(self) -> unit!:
+        if self.workspace.path == "":
+            self.save_as()
+            return
+        project.save(self.workspace.song, self.workspace.path)
+        self.workspace.saved_revision = self.workspace.revision
+        self.retitle()
+
+    func save_as(self) -> unit!:
+        var path = self.app.save_file("Save the song", self.workspace.song.name + ".prisma")
+        if path == "":
+            return
+        if not path.ends_with(".prisma"):
+            path = path + ".prisma"
+        self.workspace.song.name = paths.stem(path)
+        self.workspace.path = path
+        self.save()
+
+    func retitle(self) -> unit!:
+        let name = self.workspace.song.name if self.workspace.path == "" else paths.base(self.workspace.path)
+        self.app.set_title(f"{name} — Luced Music")
+
+    ## Audio output on or off.
+    pub func toggle_audio(self) -> unit!:
+        let engine = self.workspace.bridge.engine
+        if engine.output_running():
+            engine.stop_output()
+        else:
+            engine.start_output(64)
+        self.panels.actions.refresh()
+
+    pub func run(self, arguments: list[str]) -> unit!:
+        let smoke = "--smoke" in arguments
+        if not smoke and not ("--no-audio" in arguments):
+            self.toggle_audio() catch failure:
+                print(f"luced-music: no audio output: {failure.message}")
+        if smoke:
+            self.workspace.bridge.engine.play()
+        self.app.run(frame_limit = 3 if smoke else 0)
+
+    pub func close(self):
+        for connection in self.connections:
+            connection.disconnect()
+        self.ticking.disconnect()
+        if let notifier = self.midi:
+            notifier.close()
+        self.panels.close()
+        self.workspace.close()
+        self.app.close()

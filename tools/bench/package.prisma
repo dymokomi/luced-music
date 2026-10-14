@@ -1,0 +1,12 @@
+#prisma 4.0
+def package "luced-music-bench" {
+    str owner = "dymokomi"
+    str version = "0.0.1"
+    str kind = "tool"
+    str language = "luce"
+    str entry = "main.luc"
+    def dependency "luced-music" {
+        str owner = "dymokomi"
+        str path = "../.."
+    }
+}

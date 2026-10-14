@@ -1,0 +1,71 @@
+## The user's presets: instruments (a rack's device, its patch and voices)
+## and modules (a patch's group of nodes), each a Prism text file under
+## ~/.luced-music/presets/instruments and .../modules, named as saved. A
+## preset is kept as one graph holding the node; placing one gives it fresh
+## ids (edits.place), so it may be placed again and again.
+from luce_prism.prism import Document, Value, Encoding, write_durable
+from luce_std import files, paths
+from song import Song, Graph, GraphNode
+import project
+
+pub let instruments: str = "instruments"
+pub let modules: str = "modules"
+
+let invalid: ErrorCode = ErrorCode.package(3)
+
+## The folder of `shelf` (instruments or modules), made when missing.
+pub func folder(shelf: str) -> str!:
+    let root = paths.join(files.home_directory(), ".luced-music/presets")
+    let made = paths.join(root, shelf)
+    files.ensure_directory(made)
+    return made
+
+## The presets saved on `shelf`, by name, sorted.
+pub func names(shelf: str) -> list[str]:
+    let where = folder(shelf) catch _:
+        return []
+    let found = files.list(where) catch _:
+        return []
+    let kept: list[str] = []
+    for name in found:
+        if name.ends_with(".prisma"):
+            kept.append(name.remove_suffix(".prisma"))
+    kept.sort()
+    return kept
+
+## A file name for `name`: letters, digits, spaces, dashes and underscores.
+func file_name(name: str) -> str:
+    var made = ""
+    for character in name.trim():
+        made = made + (character if character.is_alnum() or character == " " or character == "-" or character == "_" else "_")
+    return made if made != "" else "Untitled"
+
+## Save `node` on `shelf` as `name` (replacing one of that name).
+pub func save(shelf: str, name: str, node: GraphNode) -> unit!:
+    let doc = Document()
+    doc.add("/preset", "luced_music_preset")
+    doc.set("/preset", "version", Value.integer(1))
+    doc.set("/preset", "shelf", Value.text(shelf))
+    let holder = Graph()
+    let kept = node.copy()
+    kept.name = name.trim() if name.trim() != "" else node.name
+    kept.x = 0.0
+    kept.y = 0.0
+    holder.nodes.append(kept)
+    project.write_graph(doc, "/preset/graph", holder)
+    let encoded = doc.encode(Encoding.text)
+    write_durable(paths.join(folder(shelf), file_name(name) + ".prisma"), encoded.bytes())
+
+## The preset `name` from `shelf`, its ids as saved (place it with fresh ones).
+pub func load(shelf: str, name: str) -> GraphNode!:
+    let path = paths.join(folder(shelf), file_name(name) + ".prisma")
+    let doc = Document.parse(files.read_text(path, limit = 67108864))
+    if not doc.contains("/preset") or doc.type_at("/preset") != "luced_music_preset":
+        error(invalid, f"{name} is not a Luced Music preset")
+    let holder = project.read_graph(doc, "/preset/graph", Song())
+    if holder.nodes.length != 1:
+        error(invalid, f"{name} holds no node")
+    return holder.nodes[0]
+
+pub func remove(shelf: str, name: str) -> unit!:
+    files.remove_file(paths.join(folder(shelf), file_name(name) + ".prisma"))

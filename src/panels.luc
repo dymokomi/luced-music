@@ -1,0 +1,329 @@
+## The window: the menu bar and transport along the top, the Arrangement,
+## the Network (a track's rack, or the patch of the device opened in it),
+## the Clip editor and the Parameters docked below, and the status line.
+## Every frame it reads the engine (position, meters, load) and hands it the
+## song again when an edit changed its structure.
+from luce_ui.ui import VStack, HStack, Text, Font, Button, ButtonStyle, Spacer, DStack, Panel, DockPosition, Size, ScrollView, Menu, CommandPalette, Command, TextPrompt
+from interop import Connection
+from workspace import Workspace
+from actions import Actions
+from arrangement import Arrangement
+from graph_view import GraphView
+import graph_view
+from clip_editor import ClipEditor
+from inspector import Inspector
+import edits
+import library
+import catalog
+from song import GraphNode
+from luce_std import math
+
+pub class Panels:
+    pub let body: VStack
+    pub let workspace: Workspace
+    pub let actions: Actions
+    pub let arrangement: Arrangement
+    pub let graph: GraphView
+    pub let clip_editor: ClipEditor
+    pub let inspector: Inspector
+    pub let dock: DStack
+    let clip_panel: Panel
+    let network_panel: Panel
+    var rack_menu: CommandPalette
+    var patch_menu: CommandPalette
+    let preset_prompt: TextPrompt
+    let header: HStack
+    let footer: HStack
+    let font: Font
+    let path: Text
+    let position: Text
+    let load: Text
+    let play_button: Button
+    let loop_button: Button
+    let record_button: Button
+    let metronome_button: Button
+    ## A light for MIDI coming in, lit for a moment after each message.
+    let midi_light: Text
+    var midi_lit: float = 0.0
+    ## The MIDI sources' generation the inspector's menus were built for.
+    pub var midi_generation: int = -1
+    let audio_button: Button
+    let status: Text
+    let connections: list[Connection]
+    var shown_revision: int = -1
+    var shown_playing: bool = false
+    var shown_output: bool = false
+    var meter_time: float = 0.0
+    var peak_load: float = 0.0
+
+    pub func init(self, workspace: Workspace, font: Font) -> unit!:
+        self.workspace = workspace
+        self.font = font
+        self.connections = []
+        self.actions = Actions(workspace)
+        self.arrangement = Arrangement(workspace, font)
+        self.graph = GraphView(workspace, font)
+        self.clip_editor = ClipEditor(workspace, font)
+        self.inspector = Inspector(workspace, font)
+        self.rack_menu = CommandPalette(self.actions.rack_entries + self.actions.user_rack, font = font)
+        self.patch_menu = CommandPalette(self.actions.patch_entries + self.actions.user_patch, font = font)
+        self.preset_prompt = TextPrompt(font)
+        self.connections.append(self.preset_prompt.on_submit(self.save_preset))
+        self.connections.append(self.actions.save_preset.on_trigger(self.ask_preset_name))
+        self.actions.on_add_preset = self.add_preset
+        self.graph.on_search = self.open_node_menu
+        self.connections.append(self.actions.add_node.on_trigger(self.open_node_menu))
+        self.connections.append(self.actions.frame_nodes.on_trigger(self.graph.frame_all))
+        self.actions.on_add_device = func (name: str) -> unit!:
+            let at = graph_view.place(self.graph)
+            edits.add_device(workspace, name, at.x, at.y)
+        self.actions.on_add_node = func (kind: int) -> unit!:
+            let at = graph_view.place(self.graph)
+            edits.add_node(workspace, kind, at.x, at.y)
+        # The top: menus, then the transport.
+        let menus = HStack([
+            Menu("File", [self.actions.new_song, self.actions.open_song, self.actions.save, self.actions.save_as], font = font),
+            Menu("Edit", [self.actions.undo, self.actions.redo, self.actions.delete_clips, self.actions.duplicate_clips], font = font),
+            Menu("Track", [self.actions.add_track, self.actions.delete_track, self.actions.add_notes_lane, self.actions.add_curve_lane, self.actions.delete_lane], font = font),
+            Menu("Transport", [self.actions.play, self.actions.stop, self.actions.to_start, self.actions.loop, self.actions.audio, self.actions.panic], font = font),
+            Menu("Network", [self.actions.add_node, self.actions.collapse, self.actions.expand, self.actions.save_preset, self.actions.up, self.actions.frame_nodes], font = font),
+            Menu("View", self.actions.grids + [self.actions.reset_layout], font = font),
+        ], spacing = 2.0)
+        self.position = Text("  1. 1. 000", font = font)
+        self.midi_light = Text("MIDI", font = font, muted = true)
+        self.load = Text("audio off", font = font, muted = true)
+        let start_button = self.icon_button("go-to-start", self.actions.to_start, font)
+        self.play_button = self.icon_button("play", self.actions.play, font)
+        let stop_button = self.icon_button("stop", self.actions.stop, font)
+        self.loop_button = self.icon_button("loop-region", self.actions.loop, font)
+        self.record_button = self.icon_button("record", self.actions.record, font)
+        self.metronome_button = self.icon_button("metronome", self.actions.metronome, font)
+        self.audio_button = Button("Audio off", font = font, icon = "audio-output")
+        self.connections.append(self.audio_button.on_click(func () -> unit!: self.actions.audio.trigger()))
+        let transport = HStack([
+            start_button, self.play_button, stop_button, self.record_button, self.loop_button, self.metronome_button, self.position, Spacer(), self.midi_light, self.load, self.audio_button,
+            self.icon_button("undo", self.actions.undo, font), self.icon_button("redo", self.actions.redo, font),
+        ], spacing = 4.0)
+        self.header = HStack([menus, Spacer(), transport], spacing = 8.0, padding = 4.0)
+        # The arrangement and its toolbar.
+        let arrange_tools = HStack([Button(action = self.actions.add_track, font = font, icon = "track-add"), Button(action = self.actions.add_notes_lane, font = font, icon = "note-lane"),
+                                    Button(action = self.actions.add_curve_lane, font = font, icon = "automation-curve"), Spacer(),
+                                    Menu("Grid", self.actions.grids, font = font)], spacing = 4.0, padding = 4.0)
+        let arrange_body = VStack([arrange_tools, self.arrangement], spacing = 0.0)
+        arrange_body.layout().set_flex()
+        let arrangement = Panel("Arrangement", arrange_body, minimum = Size(500.0, 200.0), closable = false, id = "arrangement")
+        # The network: where it is (Up, the path), then the graph.
+        self.path = Text("", font = font, muted = true)
+        let up = Button(action = self.actions.up, font = font)
+        up.set_style(ButtonStyle.plain)
+        let network_header = HStack([up, self.path, Spacer(), Button(action = self.actions.add_node, font = font), Button(action = self.actions.collapse, font = font),
+                                     Button(action = self.actions.save_preset, font = font), Button(action = self.actions.frame_nodes, font = font)], spacing = 4.0, padding = 4.0)
+        let network_body = VStack([network_header, self.graph], spacing = 0.0)
+        network_body.layout().set_flex()
+        self.network_panel = Panel("Network", network_body, minimum = Size(420.0, 220.0), closable = false, id = "network")
+        self.clip_panel = Panel("Clip", self.clip_editor, minimum = Size(420.0, 220.0), closable = false, id = "clip")
+        let parameters = Panel("Parameters", ScrollView(self.inspector.body), minimum = Size(300.0, 200.0), closable = false, id = "parameters")
+        self.dock = DStack([arrangement], font = font)
+        self.dock.add(parameters, arrangement, DockPosition.right)
+        self.dock.set_fraction(arrangement, 0.76)
+        self.dock.add(self.network_panel, arrangement, DockPosition.bottom)
+        self.dock.set_fraction(arrangement, 0.52)
+        self.dock.add(self.clip_panel, self.network_panel, DockPosition.tab)
+        self.dock.select(self.network_panel)
+        self.dock.layout().set_flex()
+        self.arrangement.on_open = func () -> unit!: self.dock.select(self.clip_panel)
+        self.arrangement.recorder = self.actions.recorder
+        self.status = Text("", font = font, muted = true)
+        self.footer = HStack([self.status], padding = 4.0)
+        self.body = VStack([self.header, self.dock, self.footer, self.rack_menu, self.patch_menu, self.preset_prompt], spacing = 0.0)
+        self.body.layout().set_flex()
+        self.refresh()
+
+    ## MIDI came in: light the light (poll puts it out).
+    pub func midi_seen(self) -> unit!:
+        if self.midi_lit <= 0.0:
+            self.midi_light.set_text("● MIDI")
+        self.midi_lit = 0.25
+
+    ## A button showing `icon` that runs `command`.
+    func icon_button(self, icon: str, command: Command, font: Font) -> Button!:
+        let button = Button(icon = icon, font = font)
+        self.connections.append(button.on_click(func () -> unit!: command.trigger()))
+        return button
+
+    ## The transport's buttons as the engine stands.
+    func show_transport(self) -> unit!:
+        let w = self.workspace
+        self.play_button.set_icon("pause" if w.playing else "play")
+        self.loop_button.set_style(ButtonStyle.selected if w.song.loop_on else ButtonStyle.sunken)
+        self.record_button.set_style(ButtonStyle.selected if self.actions.recorder.on else ButtonStyle.sunken)
+        self.metronome_button.set_style(ButtonStyle.selected if w.metronome else ButtonStyle.sunken)
+        let running = w.bridge.engine.output_running()
+        self.audio_button.set_text("Audio on" if running else "Audio off")
+        self.audio_button.set_style(ButtonStyle.selected if running else ButtonStyle.sunken)
+
+    pub func close(self):
+        for connection in self.connections:
+            connection.disconnect()
+        self.actions.close()
+        self.inspector.close()
+
+    ## The Clip panel, to select it.
+    pub func clip_panel_ref(self) -> Panel:
+        return self.clip_panel
+
+    ## What "Save as preset" saves: the picked device (an instrument) or
+    ## group (a module); inside a device with nothing picked, the device.
+    func preset_subject(self) -> (str, GraphNode)?:
+        let w = self.workspace
+        if let node = w.selected_node():
+            if node.kind == catalog.device_kind:
+                return (library.instruments, node)
+            if node.kind == catalog.group_kind:
+                return (library.modules, node)
+        if w.groups.length == 0:
+            if let device = w.selected_device():
+                return (library.instruments, device)
+        return none
+
+    func ask_preset_name(self) -> unit!:
+        let maybe = self.preset_subject()
+        if maybe == none:
+            self.status.set_text("Pick a device to save an instrument, or a group to save a module.")
+            return
+        let subject = maybe else return
+        let (shelf, node) = subject
+        self.preset_prompt.open("Save " + ("instrument" if shelf == library.instruments else "module") + " preset as", node.name, accept = "Save")
+
+    func save_preset(self, name: str) -> unit!:
+        let subject = self.preset_subject() else return
+        let (shelf, node) = subject
+        library.save(shelf, name, node)
+        self.reload_presets()
+        self.status.set_text(f"Saved {name} to your {shelf}: Tab offers it under My …")
+
+    ## Rebuild the node menus with the user's presets.
+    pub func reload_presets(self) -> unit!:
+        self.actions.load_presets()
+        self.rack_menu = CommandPalette(self.actions.rack_entries + self.actions.user_rack, font = self.font)
+        self.patch_menu = CommandPalette(self.actions.patch_entries + self.actions.user_patch, font = self.font)
+        self.body.set_children([self.header, self.dock, self.footer, self.rack_menu, self.patch_menu, self.preset_prompt])
+
+    ## Place the saved preset `name` from `shelf` under the network's pointer.
+    func add_preset(self, shelf: str, name: str) -> unit!:
+        let w = self.workspace
+        let at = graph_view.place(self.graph)
+        if shelf == "instrument-group":
+            let device = library.load(library.instruments, name)
+            let group = GraphNode(0, catalog.group_kind, device.name, 0.0, 0.0)
+            group.patch = device.patch
+            edits.place(w, group, at.x, at.y)
+            return
+        let node = library.load(shelf, name)
+        if shelf == library.instruments and w.showing_patch():
+            self.status.set_text("An instrument goes in a rack: Up to the rack first, or add it as a group.")
+            return
+        if shelf == library.modules and not w.showing_patch():
+            self.status.set_text("A module goes in a patch: double-click a device to open it.")
+            return
+        edits.place(w, node, at.x, at.y)
+
+    func open_node_menu(self) -> unit!:
+        self.dock.select(self.network_panel)
+        if self.workspace.showing_patch():
+            self.patch_menu.open()
+        else:
+            if self.workspace.selected_track() == none:
+                self.status.set_text("Add a track first (Cmd-T)")
+                return
+            self.rack_menu.open()
+
+    ## Bring the view up to the engine, `seconds` after the last poll. True while
+    ## the view will keep changing on its own and wants another poll soon.
+    pub func poll(self, seconds: float) -> bool!:
+        let w = self.workspace
+        let engine = w.bridge.engine
+        engine.poll()
+        w.bridge.refresh(w.song)
+        let playing = engine.is_playing()
+        let moving = playing or w.playing
+        # The transport stopped under a take (Stop, the end): keep what was played.
+        if self.actions.recorder.on and not playing and not w.playing:
+            self.actions.recorder.finish(w)
+        if moving:
+            w.playhead = engine.position()
+        w.playing = playing
+        # Meters fall at 20 dB a second.
+        while w.levels.length < w.song.tracks.length:
+            w.levels.append(0.0)
+        var sounding = false
+        for at in 0..<w.song.tracks.length:
+            let peak = engine.peak(at)
+            let fallen = w.levels[at] * (10.0 ** (-seconds))
+            w.levels[at] = peak if peak > fallen else fallen
+            if w.levels[at] > 0.001:
+                sounding = true
+        self.peak_load = math.max(self.peak_load, engine.peak_load())
+        self.meter_time += seconds
+        let output = engine.output_running()
+        if self.meter_time >= 0.5 or output != self.shown_output:
+            self.shown_output = output
+            self.meter_time = 0.0
+            if output:
+                self.load.set_text(f"DSP {self.peak_load * 100.0:.0f}%  ·  {engine.output_latency():.1f} ms  ·  {engine.sounding_voices()} voices")
+            else:
+                self.load.set_text("audio off")
+            self.peak_load = 0.0
+        if moving or sounding or playing != self.shown_playing:
+            self.shown_playing = playing
+            self.show_position()
+            self.show_transport()
+            self.arrangement.layout().invalidate()
+            self.clip_editor.layout().invalidate()
+            self.actions.refresh()
+        if w.revision != self.shown_revision:
+            self.refresh()
+        if self.midi_lit > 0.0:
+            self.midi_lit -= seconds
+            if self.midi_lit <= 0.0:
+                self.midi_light.set_text("MIDI")
+        return moving or sounding or engine.settling() or self.midi_lit > 0.0
+
+    func show_position(self) -> unit!:
+        let w = self.workspace
+        let bar = w.song.beats_per_bar
+        let beat = math.max(0.0, w.playhead)
+        let whole = int(beat)
+        let ticks = int((beat - float(whole)) * 1000.0)
+        self.position.set_text(f"{whole // bar + 1:>3}.{whole % bar + 1:>2}.{ticks:03}")
+
+    pub func refresh(self) -> unit!:
+        let w = self.workspace
+        self.shown_revision = w.revision
+        self.inspector.refresh()
+        self.actions.refresh()
+        var where = "No track"
+        if let track = w.selected_track():
+            where = track.name + " › rack"
+            if let device = w.selected_device():
+                where = track.name + " › " + device.name
+                for name in w.group_names():
+                    where = where + " › " + name
+        self.path.set_text(where)
+        self.network_panel.set_detail(where)
+        if let found11 = w.edited_clip():
+            let (track, lane, clip) = found11
+            self.clip_panel.set_detail(f"{track.name} / {clip.name}")
+        else:
+            self.clip_panel.set_detail("")
+        self.status.set_text(w.bridge.failure if w.bridge.failure != "" else hint(w))
+        self.show_position()
+        self.show_transport()
+        self.arrangement.layout().invalidate()
+        self.graph.layout().invalidate()
+        self.clip_editor.layout().invalidate()
+
+func hint(w: Workspace) -> str:
+    if w.song.tracks.length == 0:
+        return "Add a track (Cmd-T) to start."
+    return "Space plays · double-click an empty lane for a clip · Tab in the network adds instruments, effects or nodes · double-click a device to open its patch"

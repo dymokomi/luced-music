@@ -1,0 +1,546 @@
+## The arrangement: a row a track (its name, mute, solo and meter) with its
+## lanes under it, each lane a row of clips on a timeline of bars. The ruler
+## seeks (Shift-drag sets the loop); a clip drags to move (Alt copies it),
+## its right edge to resize; a double-click on an empty lane makes a clip of
+## a bar there. Under the ruler the song's Scale row holds its key changes
+## (a track keeping its own shows them on its row): double-click adds one,
+## a key's edge drags, Delete removes the picked one.
+## A mouse wheel, Cmd-scroll or a pinch zooms around the pointer
+## (Shift-wheel scrolls the rows); the middle button or a touchpad pans.
+from luce_ui.ui import Widget, Layout, Constraints, Size, Event, Painter, Point, Font
+from luce_ui import ui
+from luce_gpu.gpu import RenderTarget, Rect, Color
+from luce_window.input import EventKind, Key, ScrollUnit
+from luce_std import math
+from workspace import Workspace
+from song import Track, Lane, Clip, ScaleKey
+import song as model
+import workspace as ws
+import catalog
+from recorder import Recorder
+import edits
+import theme
+import time
+
+pub let header_width: float = 210.0
+let ruler: float = 26.0
+## The song's Scale row, under the ruler; the tracks start below it.
+let keys_height: float = 22.0
+let rows_top: float = 48.0
+let track_height: float = 28.0
+let lane_height: float = 52.0
+let edge: float = 7.0
+let edge_slop: float = 6.0
+
+## One row on screen: a track's or one of its lanes.
+struct Row:
+    var index: int
+    var track: Track
+    var lane: Lane?
+    var top: float
+    var height: float
+
+pub class Arrangement: Widget:
+    let box: Layout
+    let workspace: Workspace
+    let font: Font
+    let small: Font
+    ## Pixels a beat, the beat at the timeline's left, and the rows' scroll.
+    pub var scale: float = 30.0
+    pub var left_beat: float = 0.0
+    pub var scroll: float = 0.0
+    ## The take being recorded, drawn as it grows.
+    pub var recorder: Recorder? = none
+    ## Called when a clip opens (double-click), to show the clip editor.
+    pub var on_open: func() -> unit!? = none
+    var mode: str = ""
+    var start_x: float = 0.0
+    var start_y: float = 0.0
+    ## Where a middle-button pan last was.
+    var pan_x: float = 0.0
+    var pan_y: float = 0.0
+    var origins: list[(int, float, float)]
+    var resizing: int = -1
+    var last_click: int = 0
+    var last_x: float = -100.0
+    var follow: bool = true
+
+    pub func init(self, workspace: Workspace, font: Font) -> unit!:
+        self.workspace = workspace
+        self.font = font
+        self.small = Font(font.size() - 3.0)
+        self.origins = []
+        self.box = Layout()
+        self.box.set_flex()
+        self.box.set_interactive(true)
+        self.box.set_focusable(true)
+
+    pub func layout(self) -> Layout:
+        return self.box
+
+    pub func measure(self, available: Constraints) -> Size!:
+        return Size(600.0, 200.0)
+
+    pub func x_of(self, beat: float) -> float:
+        return header_width + (beat - self.left_beat) * self.scale
+
+    pub func beat_of(self, x: float) -> float:
+        return self.left_beat + (x - header_width) / self.scale
+
+    func rows(self) -> list[Row]:
+        let rows: list[Row] = []
+        var y = rows_top - self.scroll
+        for (index, track) in self.workspace.song.tracks.indexed():
+            rows.append(Row(index = index, track = track, lane = none, top = y, height = track_height))
+            y += track_height
+            if not track.folded:
+                for lane in track.lanes:
+                    rows.append(Row(index = index, track = track, lane = lane, top = y, height = lane_height))
+                    y += lane_height
+        return rows
+
+    func row_at(self, y: float) -> Row?:
+        for row in self.rows():
+            if y >= row.top and y < row.top + row.height:
+                return row
+        return none
+
+    ## The clip under (x, y), with whether the pointer is on its right edge.
+    func clip_at(self, x: float, y: float) -> (Clip, bool)?:
+        let row = self.row_at(y) else return none
+        let lane = row.lane else return none
+        for clip in lane.clips.reversed():
+            let left = self.x_of(clip.start)
+            let right = self.x_of(clip.end())
+            if x >= left and x <= right:
+                return (clip, x >= right - edge)
+        return none
+
+    pub func draw(self, target: RenderTarget) -> unit!:
+        let size = target.size()
+        let w = self.workspace
+        # Keep the playhead in view while playing.
+        if w.playing and self.follow:
+            let x = self.x_of(w.playhead)
+            if x > size.width - 40.0 or x < header_width:
+                self.left_beat = math.max(0.0, w.playhead - 2.0)
+        let p = Painter(target)
+        p.rectangle(Rect(0.0, 0.0, size.width, size.height), theme.backdrop())
+        let bar = float(w.song.beats_per_bar)
+        # The grid: bars, beats when there is room.
+        var beat = math.floor(self.left_beat)
+        while self.x_of(beat) < size.width:
+            let x = self.x_of(beat)
+            if x >= header_width:
+                let on_bar = math.floor(beat / bar) * bar == beat
+                if on_bar or self.scale >= 14.0:
+                    p.rectangle(Rect(x, ruler, 1.0, size.height - ruler), theme.grey(44.0) if on_bar else theme.grey(33.0))
+            beat += 1.0
+        let rows = self.rows()
+        for row in rows:
+            if row.top + row.height < rows_top or row.top > size.height:
+                continue
+            self.draw_row(p, row, size.width)
+        # The song's keys, then the ruler, over the rows.
+        p.rectangle(Rect(0.0, ruler, size.width, keys_height), theme.grey(38.0))
+        p.text("Scale", 12.0, ruler + 3.0, theme.text_muted(), self.small)
+        self.draw_keys(p, w.song.keys, ws.song_keys, ruler + 2.0, keys_height - 4.0, size.width)
+        p.rectangle(Rect(0.0, rows_top - 1.0, size.width, 1.0), theme.border())
+        # The ruler over everything: bars, the loop, the playhead's head.
+        p.rectangle(Rect(0.0, 0.0, size.width, ruler), theme.tab_strip())
+        if w.song.loop_end > w.song.loop_start:
+            let a = math.max(header_width, self.x_of(w.song.loop_start))
+            let b = math.min(size.width, self.x_of(w.song.loop_end))
+            if b > a:
+                p.rectangle(Rect(a, 2.0, b - a, ruler - 4.0), theme.loop_band() if w.song.loop_on else Color(0.2, 0.2, 0.2, 0.25))
+        var mark = math.floor(self.left_beat / bar) * bar
+        let every = bar * (1.0 if self.scale * bar >= 40.0 else (2.0 if self.scale * bar >= 20.0 else 4.0))
+        while self.x_of(mark) < size.width:
+            let x = self.x_of(mark)
+            if x >= header_width:
+                p.rectangle(Rect(x, ruler - 8.0, 1.0, 8.0), theme.text_muted())
+                p.text(f"{int(mark / bar) + 1}", x + 3.0, 4.0, theme.text_muted(), self.small)
+            mark += every
+        p.rectangle(Rect(0.0, ruler - 1.0, size.width, 1.0), theme.border())
+        p.text(f"{w.song.tempo:.1f} bpm", 10.0, 5.0, theme.text_muted(), self.small)
+        let head = self.x_of(w.playhead)
+        if head >= header_width and head <= size.width:
+            p.rectangle(Rect(head - 0.5, 0.0, 1.5, size.height), theme.playhead())
+            p.triangle(Point(head - 6.0, 0.0), Point(head + 6.0, 0.0), Point(head, 8.0), theme.playhead())
+        p.rectangle(Rect(header_width - 1.0, 0.0, 1.0, size.height), theme.border())
+        p.close()
+
+    func draw_row(self, p: Painter, row: Row, width: float) -> unit!:
+        let w = self.workspace
+        let track = row.track
+        let color = theme.track_color(track.color)
+        if let lane = row.lane:
+            let picked = lane.id == w.lane
+            p.rectangle(Rect(0.0, row.top, header_width, row.height), theme.grey(46.0) if picked else theme.grey(40.0))
+            p.rectangle(Rect(0.0, row.top, 4.0, row.height), theme.track_shade(track.color, 0.6))
+            let ink = theme.text() if picked else theme.text_muted()
+            ui.draw_icon(p.target(), "automation-curve" if lane.curve else "note-lane", Rect(14.0, row.top + 5.0, 16.0, 16.0), ink)
+            p.text(lane.name, 36.0, row.top + 6.0, ink, self.font)
+            p.rectangle(Rect(header_width, row.top + row.height - 1.0, width - header_width, 1.0), theme.grey(36.0))
+            for clip in lane.clips:
+                self.draw_clip(p, track, lane, clip, row, width)
+            self.draw_take(p, track, lane, row, width)
+        else:
+            let picked = track.id == w.track
+            p.rectangle(Rect(0.0, row.top, width, row.height), theme.grey(52.0) if picked else theme.grey(44.0))
+            p.rectangle(Rect(0.0, row.top, 6.0, row.height), color)
+            p.text(("▸ " if track.folded else "▾ ") + track.name, 12.0, row.top + 5.0, theme.text(), self.font)
+            if track.keyed == model.keyed_own:
+                self.draw_keys(p, track.keys, track.id, row.top + 4.0, row.height - 8.0, width)
+            if not track.master:
+                # Armed: lit red; hearing MIDI as the selected track: outlined.
+                let hearing = w.song.listening(track, w.track)
+                self.flag(p, header_width - 88.0, row.top + 5.0, "record", track.armed, theme.failure())
+                if hearing and not track.armed:
+                    p.rectangle(Rect(header_width - 87.0, row.top + 22.0, 16.0, 1.5), theme.failure())
+            self.flag(p, header_width - 66.0, row.top + 5.0, "mute", track.mute, theme.warning())
+            self.flag(p, header_width - 44.0, row.top + 5.0, "solo", track.solo, theme.accent())
+            # The meter: the track's level, a thin bar along the bottom.
+            let index = row.index
+            if index < w.levels.length:
+                let level = math.min(1.0, w.levels[index])
+                p.rectangle(Rect(header_width - 18.0, row.top + 4.0, 6.0, row.height - 8.0), theme.grey(30.0))
+                let tall = (row.height - 8.0) * level
+                p.rectangle(Rect(header_width - 18.0, row.top + row.height - 4.0 - tall, 6.0, tall), theme.failure() if level >= 0.99 else theme.port_color(1))
+            p.rectangle(Rect(0.0, row.top + row.height - 1.0, width, 1.0), theme.border())
+
+    ## Row `row`'s scale keys as bands from each key to the next, named.
+    func draw_keys(self, p: Painter, keys: list[ScaleKey], row: int, top: float, height: float, width: float) -> unit!:
+        let w = self.workspace
+        for (at, key) in keys.indexed():
+            let start = self.x_of(0.0 if at == 0 else key.beat)
+            let end = self.x_of(keys[at + 1].beat) if at + 1 < keys.length else width
+            let left = math.max(header_width, start)
+            if end <= left or left > width:
+                continue
+            let picked = w.focus == ws.focus_key and w.key_row == row and w.key == at
+            p.rounded_rectangle(Rect(left + 1.0, top, end - left - 2.0, height), theme.accent() if picked else (theme.grey(60.0) if at % 2 == 0 else theme.grey(54.0)), 3.0)
+            let marker = self.x_of(key.beat)
+            if marker >= header_width:
+                p.rectangle(Rect(marker, top, 2.0, height), theme.text() if picked else theme.port_color(1))
+            p.text(catalog.key_name(key.root, key.mode), math.max(header_width, marker) + 6.0, top + 2.0, theme.grey(20.0) if picked else theme.text(), self.small)
+
+    ## The key of `keys` whose band is under `x`, and whether `x` is on its edge.
+    func key_at_x(self, keys: list[ScaleKey], x: float) -> (int, bool)?:
+        var found = -1
+        for (at, key) in keys.indexed():
+            if at == 0 or self.x_of(key.beat) <= x:
+                found = at
+        if found < 0:
+            return none
+        let marker = self.x_of(keys[found].beat)
+        return (found, math.abs(x - marker) <= edge_slop)
+
+    ## A press on a row of keys: pick (and on its edge drag) a key, or on a
+    ## double-click add one at the bar.
+    func press_keys(self, row: int, x: float, double: bool) -> unit!:
+        let w = self.workspace
+        let keys = w.keys_of(row) else return
+        if double or keys.length == 0:
+            if double:
+                let bar = float(w.song.beats_per_bar)
+                edits.add_key(w, row, math.max(0.0, math.floor(self.beat_of(x) / bar) * bar))
+            return
+        let hit = self.key_at_x(keys, x) else return
+        let (at, on_edge) = hit
+        edits.pick_key(w, row, at)
+        if on_edge:
+            self.mode = "key"
+            w.begin("Move key")
+
+    ## The take growing on the lane it lands in: a band from where it began
+    ## to the playhead, and its notes so far.
+    func draw_take(self, p: Painter, track: Track, lane: Lane, row: Row, width: float) -> unit!:
+        let w = self.workspace
+        let take = self.recorder else return
+        if not take.on or not w.song.listening(track, w.track):
+            return
+        let recording = track.record_lane() else return
+        if recording.id != lane.id:
+            return
+        let left = math.max(header_width, self.x_of(take.start))
+        let right = math.min(width, self.x_of(w.playhead))
+        if right > left:
+            p.rectangle(Rect(left, row.top + 2.0, right - left, row.height - 4.0), Color(0.85, 0.2, 0.2, 0.22))
+        for taken in take.notes:
+            if taken.track != track.id:
+                continue
+            let note = taken.note
+            let x = self.x_of(note.start)
+            let y = row.top + 4.0 + (row.height - 10.0) * (1.0 - math.clamp(float(note.pitch - 36) / 60.0, 0.0, 1.0))
+            p.rectangle(Rect(math.max(header_width, x), y, math.max(2.0, note.length * self.scale), 2.0), theme.failure())
+
+    ## A mute or solo switch: the icon, lit in `color` when on.
+    func flag(self, p: Painter, x: float, y: float, icon: str, on: bool, color: Color) -> unit!:
+        ui.draw_icon(p.target(), icon, Rect(x + 1.0, y + 1.0, 16.0, 16.0), color if on else theme.text_muted())
+
+    func draw_clip(self, p: Painter, track: Track, lane: Lane, clip: Clip, row: Row, width: float) -> unit!:
+        let w = self.workspace
+        let left = self.x_of(clip.start)
+        let right = self.x_of(clip.end())
+        if right < header_width or left > width:
+            return
+        let x = math.max(left, header_width)
+        let top = row.top + 2.0
+        let height = row.height - 4.0
+        let picked = clip.id in w.clips
+        let shown = clip.id == w.clip
+        p.rounded_rectangle(Rect(x, top, right - x, height), theme.accent() if picked else theme.track_shade(track.color, 0.85), 3.0)
+        p.rounded_rectangle(Rect(x + 1.0, top + 1.0, right - x - 2.0, height - 2.0), theme.track_shade(track.color, 0.42 if shown else 0.32), 3.0)
+        p.rectangle(Rect(x + 1.0, top + 1.0, right - x - 2.0, 13.0), theme.track_shade(track.color, 0.6))
+        if right - x > 30.0:
+            p.text(clip.name, x + 4.0, top, theme.text(), self.small)
+        let body_top = top + 15.0
+        let body = height - 17.0
+        let period = clip.loop if clip.loop > 0.0 else clip.length
+        if lane.curve:
+            self.draw_curve(p, lane, clip, left, x, right, body_top, body, period, track)
+        else:
+            if clip.notes.length > 0:
+                var low = clip.notes[0].pitch
+                var high = low
+                for note in clip.notes:
+                    low = note.pitch if note.pitch < low else low
+                    high = note.pitch if note.pitch > high else high
+                let span = float(high - low if high - low > 11 else 11)
+                var offset = 0.0
+                while offset < clip.length:
+                    for note in clip.notes:
+                        let at = offset + note.start
+                        if note.start >= period or at >= clip.length:
+                            continue
+                        let a = math.max(x, left + at * self.scale)
+                        let b = math.min(right - 1.0, left + math.min(at + note.length, clip.length) * self.scale)
+                        if b <= a:
+                            continue
+                        let y = body_top + body - 3.0 - (float(note.pitch - low) / span) * (body - 5.0)
+                        p.rectangle(Rect(a, y, math.max(1.0, b - a), 2.5), theme.track_color(track.color))
+                    offset += period
+                    if offset < clip.length:
+                        let divider = left + offset * self.scale
+                        if divider > x:
+                            p.rectangle(Rect(divider, body_top, 1.0, body), theme.track_shade(track.color, 0.55))
+
+    func draw_curve(self, p: Painter, lane: Lane, clip: Clip, left: float, x: float, right: float, top: float, height: float, period: float, track: Track) -> unit!:
+        if clip.points.length == 0:
+            return
+        let span = lane.high - lane.low if lane.high > lane.low else 1.0
+        var offset = 0.0
+        var previous: Point? = none
+        while offset < clip.length:
+            for point in clip.points:
+                let at = offset + point.beat
+                if at > clip.length:
+                    continue
+                let here = Point(left + at * self.scale, top + height - (point.value - lane.low) / span * height)
+                if let before = previous:
+                    if here.x >= x and before.x <= right:
+                        p.line(Point(math.max(x, before.x), before.y), Point(math.min(right, here.x), here.y), 1.5, theme.track_color(track.color))
+                previous = here
+            offset += period
+
+    pub func event(self, event: Event) -> unit!:
+        let w = self.workspace
+        if event.cancelled or event.kind == EventKind.focus_lost or event.kind == EventKind.overflow:
+            if self.mode == "move" or self.mode == "resize":
+                w.cancel()
+            self.mode = ""
+        elif event.kind == EventKind.key_down:
+            if event.key == Key.delete or event.key == Key.backspace:
+                if w.focus == ws.focus_key:
+                    edits.delete_key(w)
+                else:
+                    edits.delete_clips(w)
+            elif event.key == Key.d and (event.meta or event.control):
+                edits.duplicate_clips(w)
+            elif event.key == Key.escape:
+                if self.mode == "move" or self.mode == "resize":
+                    w.cancel()
+                self.mode = ""
+        elif event.kind == EventKind.magnify:
+            self.zoom_about(math.max(0.1, 1.0 + event.scroll_y), event.x)
+        elif event.kind == EventKind.scroll:
+            let wheel = event.scroll_unit != ScrollUnit.points
+            if event.meta or event.control or (wheel and not event.shift and event.scroll_y != 0.0):
+                self.zoom_about(math.exp(event.scroll_y * (0.12 if wheel else 0.01)), event.x)
+            else:
+                let factor = 30.0 if wheel else 1.0
+                var dx = event.scroll_x * factor
+                var dy = event.scroll_y * factor
+                if event.shift and dx == 0.0 and not wheel:
+                    dx = dy
+                    dy = 0.0
+                self.pan(dx, dy)
+        elif event.kind == EventKind.pointer_down and event.inside and event.button == 2:
+            self.mode = "pan"
+            self.pan_x = event.x
+            self.pan_y = event.y
+        elif event.kind == EventKind.pointer_down and event.inside and event.button == 0:
+            self.press(event)
+        elif event.kind == EventKind.pointer_moved:
+            if self.mode == "pan":
+                self.pan(event.x - self.pan_x, event.y - self.pan_y)
+                self.pan_x = event.x
+                self.pan_y = event.y
+            else:
+                self.drag(event)
+        elif event.kind == EventKind.pointer_up:
+            if self.mode == "move" or self.mode == "resize" or self.mode == "key":
+                if event.x == self.start_x and event.y == self.start_y:
+                    w.cancel()
+                else:
+                    w.commit()
+            elif self.mode == "loop":
+                w.changed()
+            self.mode = ""
+        self.box.invalidate()
+
+    ## Move the view `dx` pixels along the timeline and `dy` down the rows.
+    func pan(self, dx: float, dy: float):
+        self.left_beat = math.max(0.0, self.left_beat - dx / self.scale)
+        self.scroll = math.max(0.0, self.scroll - dy)
+        self.follow = false
+
+    pub func zoom_about(self, factor: float, x: float):
+        let beat = self.beat_of(x)
+        self.scale = math.max(2.0, math.min(400.0, self.scale * factor))
+        self.left_beat = math.max(0.0, beat - (x - header_width) / self.scale)
+        self.box.invalidate()
+
+    func press(self, event: Event) -> unit!:
+        let w = self.workspace
+        self.start_x = event.x
+        self.start_y = event.y
+        let now = time.now()
+        let double = now - self.last_click < 400000000 and math.abs(event.x - self.last_x) < 5.0
+        self.last_click = now
+        self.last_x = event.x
+        if event.y >= ruler and event.y < rows_top:
+            if event.x >= header_width:
+                self.press_keys(ws.song_keys, event.x, double)
+            return
+        if event.y < ruler:
+            if event.x < header_width:
+                return
+            self.follow = true
+            if event.shift:
+                self.mode = "loop"
+                let beat = edits.snap(w, self.beat_of(event.x))
+                w.song.loop_start = beat
+                w.song.loop_end = beat
+                w.song.loop_on = true
+            else:
+                self.mode = "seek"
+                self.seek(event.x)
+            return
+        let row_maybe = self.row_at(event.y)
+        if row_maybe == none:
+            w.clips = []
+            w.revision += 1
+            return
+        let row = row_maybe else return
+        if event.x < header_width:
+            if row.lane == none:
+                if event.x >= header_width - 88.0 and event.x < header_width - 69.0 and not row.track.master:
+                    edits.toggle_arm(w, row.track)
+                elif event.x >= header_width - 66.0 and event.x < header_width - 47.0:
+                    edits.toggle_mute(w, row.track)
+                elif event.x >= header_width - 44.0 and event.x < header_width - 25.0:
+                    edits.toggle_solo(w, row.track)
+                elif event.x < 26.0 or double:
+                    row.track.folded = not row.track.folded
+                    w.select_track(row.track.id)
+                else:
+                    w.select_track(row.track.id)
+            elif let lane = row.lane:
+                w.select_lane(row.track.id, lane.id)
+            return
+        if let found6 = self.clip_at(event.x, event.y):
+            let (clip, on_edge) = found6
+            w.select_clip(clip.id, add = event.shift)
+            if double:
+                if let open = self.on_open:
+                    open()
+                return
+            if event.shift:
+                return
+            if event.alt:
+                edits.duplicate_clips(w)
+            self.origins = []
+            for id in w.clips:
+                if let found7 = w.song.clip(id):
+                    let (_, _, picked) = found7
+                    self.origins.append((id, picked.start, picked.length))
+            self.mode = "resize" if on_edge else "move"
+            self.resizing = clip.id
+            w.begin("Resize clip" if on_edge else "Move clips")
+            return
+        if row.lane == none and row.track.keyed == model.keyed_own:
+            w.select_track(row.track.id)
+            self.press_keys(row.track.id, event.x, double)
+            return
+        if let lane = row.lane:
+            w.select_lane(row.track.id, lane.id)
+            w.clips = []
+            if double:
+                let bar = float(w.song.beats_per_bar)
+                let start = math.floor(self.beat_of(event.x) / bar) * bar
+                edits.add_clip(w, lane, math.max(0.0, start), bar)
+                if let open = self.on_open:
+                    open()
+        else:
+            w.select_track(row.track.id)
+
+    func seek(self, x: float):
+        let w = self.workspace
+        let beat = math.max(0.0, edits.snap(w, self.beat_of(x)))
+        w.bridge.engine.seek(beat)
+        w.playhead = beat
+
+    func drag(self, event: Event) -> unit!:
+        let w = self.workspace
+        if self.mode == "seek":
+            self.seek(event.x)
+        elif self.mode == "loop":
+            let a = edits.snap(w, self.beat_of(self.start_x))
+            let b = edits.snap(w, self.beat_of(event.x))
+            w.song.loop_start = math.max(0.0, math.min(a, b))
+            w.song.loop_end = math.max(a, b)
+            w.bridge.engine.set_loop(w.song.loop_on, w.song.loop_start, w.song.loop_end)
+        elif self.mode == "key":
+            if let keys = w.keys_of(w.key_row):
+                if w.key >= 0 and w.key < keys.length:
+                    let beat = math.max(0.0, edits.snap(w, self.beat_of(event.x), not event.meta))
+                    keys[w.key].beat = beat
+                    edits.settle_keys(w, w.key_row, beat)
+        elif self.mode == "move":
+            let shift = edits.snap(w, (event.x - self.start_x) / self.scale, not event.meta)
+            for (id, start, _) in self.origins:
+                if let found8 = w.song.clip(id):
+                    let (_, _, clip) = found8
+                    clip.start = math.max(0.0, start + shift)
+            # One clip may move to another lane of its kind.
+            if self.origins.length == 1:
+                if let row = self.row_at(event.y):
+                    if let lane = row.lane:
+                        if let found9 = w.song.clip(self.origins[0].0):
+                            let (_, from_lane, clip) = found9
+                            if lane.id != from_lane.id and lane.curve == from_lane.curve:
+                                from_lane.clips = from_lane.clips.filter((c) => c.id != clip.id)
+                                lane.clips.append(clip)
+                                w.lane = lane.id
+                                w.track = row.track.id
+            w.revision += 1
+        elif self.mode == "resize":
+            if let found10 = w.song.clip(self.resizing):
+                let (_, _, clip) = found10
+                for (id, _, length) in self.origins:
+                    if id == clip.id:
+                        let grown = edits.snap(w, length + (event.x - self.start_x) / self.scale, not event.meta)
+                        clip.length = math.max(w.grid if w.grid > 0.0 else 0.25, grown)
+            w.revision += 1
